@@ -36,7 +36,7 @@ class Hypers:
     gamma = .99
     tau = .005
     warmup = 2000
-    max_steps = int(10e6)
+    max_steps = int(1e6)
     num_envs = 10
     horizon = 500
     buffer_size = int(1e5)
