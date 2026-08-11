@@ -6,7 +6,6 @@ import robosuite as suite
 from robosuite import load_composite_controller_config
 from robosuite.wrappers.gym_wrapper import GymWrapper
 from gymnasium.vector import SyncVectorEnv
-from gymnasium.wrappers.vector.stateful_observation import NormalizeObservation
 from gymnasium.wrappers.common import Autoreset
 
 import torch,sys,time,mlflow,queue
@@ -19,7 +18,6 @@ import torch.multiprocessing as mp
 
 from copy import deepcopy
 from tqdm import tqdm
-from itertools import chain
 from dataclasses import dataclass
 from threading import Thread
 
@@ -66,7 +64,6 @@ def vec_env():
         return x
     
     env = SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
-    #env = NormalizeObservation(env)
     return env
 
 
@@ -134,7 +131,7 @@ def create_storage(): # storage for the step env method where episodes steps are
     )
 
 
-def step(queue,policy,mean,var,count,stat_logger=False): # main method for stepping in the envs and collecting transitions 
+def step(queue,policy): # main method for stepping in the envs and collecting transitions 
     with torch.no_grad():
 
         env = vec_env()
@@ -169,13 +166,8 @@ def step(queue,policy,mean,var,count,stat_logger=False): # main method for stepp
                 queue.put(data)
                 pointer = 0 
                 stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
-                """
-                if stat_logger:# tracking mean and variance
-                    mean.copy_(torch.from_numpy(env.obs_rms.mean))
-                    var.copy_(torch.from_numpy(env.obs_rms.var))
-                    count.copy_(torch.as_tensor(env.obs_rms.count))
-                """
-        env.close()
+
+    env.close()
 
 
 def create_buffer(): # buffer storage where many episode are stored for random sampling later
@@ -290,9 +282,6 @@ class main:
             "alpha optim state":self.alpha_optim.state_dict(),
             "log_alpha":self.log_alpha,
 
-            "obs_rms_mean": self.shared_mean.cpu(), 
-            "obs_rms_var": self.shared_var.cpu(),
-            "obs_rms_count" : self.shared_count.cpu()
         }
         torch.save(check,f"{self.storage_path}{step}.pth")
 
@@ -312,16 +301,12 @@ class main:
 
             self.log_alpha.data.copy_(check["log_alpha"].data)
             self.alpha_optim.load_state_dict(check["alpha optim state"])
-            # env statistics
-            self.shared_mean = check["obs_rms_mean"]
-            self.shared_var = check["obs_rms_var"]
-            self.shared_count = check["obs_rms_count"]
-
+        
 
     def train(self,start=False):
         if start:
 
-            mlflow.set_experiment("sac-lift-Robosuite")
+            mlflow.set_experiment("sac-lift-robosuite")
             with mlflow.start_run() as run:
                 run_id = run.info.run_id
 
@@ -332,17 +317,8 @@ class main:
                 
                 ep_queue = mp.Queue(maxsize=10) 
                 process__ = []
-                self.shared_mean = torch.zeros(hypers.obs_dim,dtype=torch.float).share_memory_()
-                self.shared_var = torch.zeros(hypers.obs_dim,dtype=torch.float).share_memory_()
-                self.shared_count = torch.zeros(1,dtype=torch.float).share_memory_()
-                
                 for n in range(5):
-                    step_thread = mp.Process(
-                        target=step,
-                        args=(ep_queue,actor_cpu,self.shared_mean,self.shared_var,self.shared_count),
-                        kwargs = {"stat_logger": n==0},
-                        daemon=True
-                    )
+                    step_thread = mp.Process(target=step,args=(ep_queue,actor_cpu,),daemon=True)
                     process__.append(step_thread)
                     step_thread.start()
 
@@ -449,7 +425,25 @@ class main:
                             },
                             step = traj
                         )
-                        
+                
+                # killing processes and closing thread and queue
+                for p in process__:
+                    if p.is_alive():
+                        p.terminate()  
+                        p.join(timeout=1.0)
+
+                for q in [ep_queue, batch_queue]:
+                    try:
+                        while not q.empty():
+                            q.get_nowait()
+                        q.close()
+                        q.cancel_join_thread()
+                    except Exception:
+                        pass
+
+                filler_thread.join(timeout=1.0)
+                sampler_thread.join(timeout=1.0)
+                            
 
 if __name__ == "__main__": 
     mp.set_start_method("spawn",force=True)
