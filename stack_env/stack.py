@@ -2,25 +2,27 @@ import warnings,logging
 warnings.filterwarnings("ignore")
 logging.disable(logging.CRITICAL)
 
-import robosuite as suite
+import robosuite
 from robosuite import load_composite_controller_config
 from robosuite.wrappers.gym_wrapper import GymWrapper
 from gymnasium.vector import SyncVectorEnv
-from gymnasium.wrappers.vector.stateful_observation import NormalizeObservation
 from gymnasium.wrappers.common import Autoreset
 
-import torch,sys,time,mlflow,queue
+import torch
 from torch.optim import Adam
-import numpy as np
 import torch.multiprocessing as mp
+import numpy as np
 
+import sys,time,mlflow,queue
 from copy import deepcopy
 from tqdm import tqdm
 from itertools import chain
 from dataclasses import dataclass
 from threading import Thread
 
-# from networks import HLP,LLP,Critic
+from goals import *
+from networks import *
+
 
 @dataclass(frozen=False)
 class Hypers:
@@ -57,53 +59,14 @@ env_configs = {
 
 def vec_env():
     def make_env():
-        x = suite.make(env_name = "Stack",**env_configs) # Lift
+        x = robosuite.make(env_name = "Stack",**env_configs) # Lift
         x = GymWrapper(x,list(x.observation_spec()))
         x.metadata = {"render_mode":[]}
         x = Autoreset(x)
         return x
     
     env = SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
-    #env = NormalizeObservation(env)
     return env
-
-# most of the code here is derived from the staged_rewards() method in the source code of the Stack environment
-
-def goal_reach_block(env): # reach
-    obs = env.unwrapped._get_observations()
-    cubeA_pos = obs.get("cubeA_pos")
-    cubeB_pos = obs.get("cubeB_pos")
-    gripper_to_cubeA = np.linalg.norm(obs.get("gripper_to_cubeA")) # scalar distance 
-    
-    reach_score = 1.0 - np.tanh(10.0 * gripper_to_cubeA)
-    
-    if reach_score > 0.95:
-        achieved = torch.tensor([1.0],dtype=torch.float)
-    else:
-        achieved = torch.tensor([0.0],dtype=torch.float)
-
-    reach_reward = reach_score
-    goal_obs = achieved  # goal [1.0,]
-    
-
-def goal_lift_block(env): # grasp and lift
-    mujoco_wrapper = env.unwrapped
-    grasped = mujoco_wrapper._check_grasp(env_configs.get("gripper_types"),object_geoms=mujoco_wrapper.cubeA)
-    grasp_obs_tensor = torch.tensor([grasped],dtype=torch.float)
-    reward_lift = 1 if grasped else 0.0
-    
-    cubeA_height = mujoco_wrapper._get_observations().get("cubeA_pos")[2]
-    table_height = mujoco_wrapper.table_offset[2]
-    cubeA_lifted = cubeA_height > table_height + 0.04  
-    cubeA_lifted_tensor = torch.tensor([cubeA_lifted],dtype=torch.float) 
-
-    goal_obs = torch.cat([grasp_obs_tensor,cubeA_lifted_tensor]) # goal [1.0,1.0]
-    reward_lift += 1.0 if cubeA_lifted else 0.0
-
-   
-    def stack_blocks(env):
-        pass
-
 
 
 def create_storage(): # storage for the step env method where episodes steps are stored
@@ -153,12 +116,7 @@ def step(queue,policy,mean,var,count,stat_logger=False): # main method for stepp
                 queue.put(data)
                 pointer = 0 
                 stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
-                """
-                if stat_logger:# tracking mean and variance
-                    mean.copy_(torch.from_numpy(env.obs_rms.mean))
-                    var.copy_(torch.from_numpy(env.obs_rms.var))
-                    count.copy_(torch.as_tensor(env.obs_rms.count))
-                """
+        
         env.close()
 
 
@@ -249,9 +207,7 @@ class main:
         self.q2_target.compile()
         
         self.q_optim = Adam(chain(self.q1.parameters(),self.q2.parameters()),lr=hypers.lr,fused=True)
-        #self.q1_optim = Adam(self.q1.parameters(),lr=hypers.lr,fused=True)
-        #self.q2_optim = Adam(self.q2.parameters(),lr=hypers.lr,fused=True)
-
+    
         self.entropy_target = -hypers.action_dim
         self.log_alpha = torch.tensor(1.0,requires_grad=True,device=hypers.device)  
         self.alpha_optim = Adam([self.log_alpha],lr=hypers.lr)
@@ -269,16 +225,9 @@ class main:
             "q2 target":self.q2_target.state_dict(),
             
             "actor optim state" : self.actor.optim.state_dict(),
-            #"q1 optim state":self.q1_optim.state_dict(),
-            #"q2 optim state":self.q2_optim.state_dict(),
-
             "alpha optim state":self.alpha_optim.state_dict(),
             "log_alpha":self.log_alpha,
-
-            #"obs_rms_mean": self.shared_mean.cpu(), 
-            #"obs_rms_var": self.shared_var.cpu(),
-            #"obs_rms_count" : self.shared_count.cpu()
-        }
+         }
         torch.save(check,f"{self.storage_path}{step}.pth")
 
     
@@ -297,10 +246,6 @@ class main:
 
             self.log_alpha.data.copy_(check["log_alpha"].data)
             self.alpha_optim.load_state_dict(check["alpha optim state"])
-            # env statistics
-            #self.shared_mean = check["obs_rms_mean"]
-            #self.shared_var = check["obs_rms_var"]
-            #self.shared_count = check["obs_rms_count"]
 
 
     def train(self,start=False):
@@ -365,8 +310,7 @@ class main:
                         min_q_target = torch.min(self.q1_target(nx_states,nx_actions),self.q2_target(nx_states,nx_actions))
                         q_target = reward + hypers.gamma * (1-terminated) * (min_q_target - alpha.detach() * log_nx_actions)
                         # R(st|at) + gamma * (Q(st,at) - alpha * log pi(at|st))
-                    
-                    
+                     
                     q1_pred = self.q1(states,actions) 
                     q2_pred = self.q2(states,actions)
 
@@ -376,22 +320,6 @@ class main:
                     torch.nn.utils.clip_grad_norm_(chain(self.q1.parameters(),self.q2.parameters()),1.0)
                     self.q_optim.step() 
 
-                    """
-                    q1_pred = self.q1(states,actions) 
-                    q1_loss = F.smooth_l1_loss(q1_pred,q_target)
-                    self.q1_optim.zero_grad(set_to_none=True)
-                    q1_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.q1.parameters(),1.0)
-                    self.q1_optim.step() # critic 1 
-
-                    q2_pred = self.q2(states,actions) 
-                    q2_loss = F.smooth_l1_loss(q2_pred,q_target)
-                    self.q2_optim.zero_grad(set_to_none=True)
-                    q2_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.q2.parameters(),1.0)
-                    self.q2_optim.step() # critic 2
-                    """
-             
                     for q1_pars,q1_target_pars in zip(self.q1.parameters(),self.q1_target.parameters()):
                         q1_target_pars.data.mul_(1.0 - hypers.tau).add_(q1_pars.data,alpha=hypers.tau)
                 
@@ -440,9 +368,6 @@ class main:
 
                                 "critic/log action" : (alpha * log_nx_actions).mean().item(),
                                 "critic/pred min Q target" : min_q_target.mean().item(),
-                                #"critic/critic 1 Loss" : q1_loss.item(),
-                                #"critic/critic 2 Loss" : q2_loss.item()
-
                             },
                             step = traj
                         )
