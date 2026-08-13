@@ -1,9 +1,10 @@
 import torch 
 import torch.nn as nn 
 import torch.nn.functional as F
-from torch.distributions import Normal
+from torch.distributions import Normal,Categorical
 import numpy as np
 
+# observation dim = 162 and action dim = 9
 
 def weight_init(l):
     if isinstance(l,nn.Linear):
@@ -11,18 +12,41 @@ def weight_init(l):
         nn.init.constant_(l.bias,0.0)
 
 
-class Actor(nn.Module):
-    def __init__(self):
+class HL(nn.Module):
+    def __init__(self): # high level policy
         super().__init__()
-        self.l1 = nn.Linear(hypers.obs_dim,256)
+        goals = torch.tensor([
+            [1.0, 1.0], # reach
+            [1.0, 1.0], # lift
+            [1.0, 0.0]  # stack
+        ], dtype=torch.float32)
+        self.register_buffer("goal_table",goals)
+
+        self.l1 = nn.Linear(162,256)
         self.l2 = nn.Linear(256,256)
-        self.l_mean = nn.Linear(256, hypers.action_dim)
-        self.l_std = nn.Linear(256,hypers.action_dim)
+        self.l3 = nn.Linear(256,3)
         self.apply(weight_init)
-        self.optim = torch.optim.Adam(self.parameters(),hypers.lr)
 
     def forward(self,obs):
         x = F.silu(self.l1(obs))
+        x = F.silu(self.l2(x))
+        x = F.softmax(F.silu(self.l3(x)),-1)
+        idx = Categorical(x).sample()
+        return self.goal_table[idx] 
+
+
+class LL(nn.Module): # low level policy
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.Linear(162+2,256) # -> obs + goal -> 256
+        self.l2 = nn.Linear(256,256)
+        self.l_mean = nn.Linear(256,9)
+        self.l_std = nn.Linear(256,9)
+        self.apply(weight_init)
+        
+    def forward(self,obs,goal):
+        x = torch.cat([obs,goal],dim=1)
+        x = F.silu(self.l1(x))
         x = F.silu(self.l2(x))
         
         mean = self.l_mean(x)
@@ -42,7 +66,7 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(hypers.obs_dim + hypers.action_dim,256)
+        self.l1 = nn.Linear(162 + 9,256)
         self.l2 = nn.Linear(256,256)
         self.l3 = nn.Linear(256,256)
         self.output = nn.Linear(256,1)
