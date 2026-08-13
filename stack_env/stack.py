@@ -1,6 +1,5 @@
 import warnings,logging
-warnings.filterwarnings("ignore")
-logging.disable(logging.CRITICAL)
+warnings.filterwarnings("ignore") ; logging.disable(logging.CRITICAL)
 
 import robosuite
 from robosuite.wrappers.gym_wrapper import GymWrapper
@@ -172,29 +171,33 @@ class main:
         self.n = 0 # tracking number for model data saving  
             
     
-    def save(self,step):
+    def save(self, step):
         check = {
-            "actor state":self.actor.state_dict(), 
-            "q1 state":self.q1.state_dict(),
-            "q1 target":self.q1_target.state_dict(),
-            "q2 state":self.q2.state_dict(),
-            "q2 target":self.q2_target.state_dict(),
+            "high level state": self.hlp.state_dict(),
+            "actor state": self.actor.state_dict(), 
+            "q1 state": self.q1.state_dict(),
+            "q1 target": self.q1_target.state_dict(),
+            "q2 state": self.q2.state_dict(),
+            "q2 target": self.q2_target.state_dict(),
             
+            "self.high level optim state": self.hlp_optim.state_dict(),
             "actor optim state" : self.actor.optim.state_dict(),
-            "alpha optim state":self.alpha_optim.state_dict(),
-            "log_alpha":self.log_alpha,
+            "alpha optim state": self.alpha_optim.state_dict(),
+
+            "log_alpha": self.log_alpha,
          }
         torch.save(check,f"{self.storage_path}{step}.pth")
 
     
-    def load(self,model_path = None,strict=True):
+    def load(self, model_path=None, strict=True):
         if model_path is not None:
-            check = torch.load(model_path,weights_only=False,map_location=hypers.device)
-            self.actor.load_state_dict(check["actor state"],strict)
+            check = torch.load(model_path, weights_only=False, map_location=hypers.device)
+            self.hlp_optim.load_state_dict(check["high level optim state"], strict)
+            self.actor.load_state_dict(check["actor state"], strict)
             self.q1.load_state_dict(check["q1 state"],strict)
-            self.q1_target.load_state_dict(check["q1 target"],strict)
-            self.q2.load_state_dict(check["q2 state"],strict)
-            self.q2_target.load_state_dict(check["q2 target"],strict)
+            self.q1_target.load_state_dict(check["q1 target"], strict)
+            self.q2.load_state_dict(check["q2 state"], strict)
+            self.q2_target.load_state_dict(check["q2 target"], strict)
             
             self.actor.optim.load_state_dict(check["actor optim state"])
             self.q1_optim.load_state_dict(check["q1 optim state"])
@@ -211,7 +214,7 @@ class main:
 
             self.load(model_path=None)
             actor_cpu = Actor()
-            actor_cpu.load_state_dict(self.actor.state_dict()) # importand when resuming with a pretrained model
+            actor_cpu.load_state_dict(self.actor.state_dict()) # important when resuming with a pretrained model
             actor_cpu.share_memory()
             
             ep_queue = mp.Queue(maxsize=10) 
@@ -244,7 +247,8 @@ class main:
 
             for traj in tqdm(range(hypers.max_steps + 1),total=hypers.max_steps + 1):
                 states,nx_states,reward,terminated,actions = batch_queue.get()
-
+                
+                # moving data to the gpu
                 states = states.to(hypers.device,dtype=torch.float)
                 nx_states = nx_states.to(hypers.device,dtype=torch.float)
                 reward = reward.to(hypers.device,dtype=torch.float)
