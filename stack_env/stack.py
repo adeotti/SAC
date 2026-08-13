@@ -3,7 +3,6 @@ warnings.filterwarnings("ignore")
 logging.disable(logging.CRITICAL)
 
 import robosuite
-from robosuite import load_composite_controller_config
 from robosuite.wrappers.gym_wrapper import GymWrapper
 from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers.common import Autoreset
@@ -17,49 +16,15 @@ import sys,time,mlflow,queue
 from copy import deepcopy
 from tqdm import tqdm
 from itertools import chain
-from dataclasses import dataclass
 from threading import Thread
 
 from goals import *
 from networks import *
-
-
-@dataclass(frozen=False)
-class Hypers:
-    ROBOT = "Panda"
-    env_name = None
-    device = torch.device("cuda:0")
-    obs_dim = 162   
-    action_dim = 9     # action space for a single env 
-    batch_size = 1024
-    lr = 3e-4
-    gamma = .99
-    tau = .005
-    warmup = 2000
-    max_steps = int(10e6)
-    num_envs = 10
-    horizon = 500
-    buffer_size = int(1e5)
-
-hypers = Hypers()
-    
-cont_config = controller = load_composite_controller_config(robot=hypers.ROBOT)
-env_configs = {
-    "robots":"Panda",
-    "controller_configs": cont_config,
-    "gripper_types":"JacoThreeFingerDexterousGripper",
-    "has_renderer":False,
-    "use_camera_obs":False,
-    "has_offscreen_renderer":False,
-    "reward_shaping":True,             # Dense rewards env version 
-    "horizon":hypers.horizon,          # Max steps before reset or trunc = True
-    "control_freq":20,
-    "reward_scale":1.0
-    }
+from configs import *
 
 def vec_env():
     def make_env():
-        x = robosuite.make(env_name = "Stack",**env_configs) # Lift
+        x = robosuite.make(env_name="Stack", **env_configs) 
         x = GymWrapper(x,list(x.observation_spec()))
         x.metadata = {"render_mode":[]}
         x = Autoreset(x)
@@ -262,17 +227,9 @@ class main:
                 
                 ep_queue = mp.Queue(maxsize=10) 
                 process__ = []
-                self.shared_mean = torch.zeros(hypers.obs_dim,dtype=torch.float).share_memory_()
-                self.shared_var = torch.zeros(hypers.obs_dim,dtype=torch.float).share_memory_()
-                self.shared_count = torch.zeros(1,dtype=torch.float).share_memory_()
-                
+           
                 for n in range(5):
-                    step_thread = mp.Process(
-                        target=step,
-                        args=(ep_queue,actor_cpu,self.shared_mean,self.shared_var,self.shared_count),
-                        kwargs = {"stat_logger": n==0},
-                        daemon=True
-                    )
+                    step_thread = mp.Process(target=step, args=(ep_queue,actor_cpu,), daemon=True)
                     process__.append(step_thread)
                     step_thread.start()
 
@@ -326,6 +283,7 @@ class main:
                     for q2_pars,q2_target_pars in zip(self.q2.parameters(),self.q2_target.parameters()):
                         q2_target_pars.data.mul_(1.0 - hypers.tau).add_(q2_pars.data,alpha=hypers.tau)
                     
+                    # freezing critcs weights
                     for p in self.q1.parameters() : p.requires_grad = False
                     for p in self.q2.parameters() : p.requires_grad = False
 
@@ -338,7 +296,7 @@ class main:
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(),1.0)
                     self.actor.optim.step()
 
-                    actor_cpu.load_state_dict(self.actor.state_dict()) # !!
+                    actor_cpu.load_state_dict(self.actor.state_dict()) # update cpu weights
 
                     for p in self.q1.parameters() : p.requires_grad = True
                     for p in self.q2.parameters() : p.requires_grad = True
