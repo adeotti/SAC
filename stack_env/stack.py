@@ -234,6 +234,38 @@ class main:
             },
             step=step
         )
+    
+    def pre_launch(self,run_id):
+        self.load(model_path=None)
+        self.actor_cpu = Actor()
+        self.actor_cpu.load_state_dict(self.actor.state_dict()) # important when resuming with a pretrained model
+        self.actor_cpu.share_memory()
+        
+        ep_queue = mp.Queue(maxsize=10) 
+        process__ = []
+   
+        for n in range(5):
+            step_thread = mp.Process(target=step, args=(ep_queue,actor_cpu,), daemon=True)
+            process__.append(step_thread)
+            step_thread.start()
+
+        print_queue_loading(ep_queue)
+        
+        buffer = create_buffer() # init and share memory of tensors in buffer 
+        current_capacity = buffer[-1]
+        for tensor in buffer : 
+            tensor.share_memory_()
+
+        self.batch_queue = mp.Queue(maxsize=10)
+        filler_thread = Thread(target=filler,args=(buffer,ep_queue,run_id,),daemon=True)
+        filler_thread.start()
+
+        while not current_capacity.item() == 20:
+            print(current_capacity)
+            time.sleep(0.2)
+        
+        sampler_thread = Thread(target=sampler,args=(buffer,batch_queue,),daemon=True)
+        sampler_thread.start()
 
 
     def train(self):
@@ -241,41 +273,12 @@ class main:
         with mlflow.start_run() as run:
             run_id = run.info.run_id
 
-            self.load(model_path=None)
-            actor_cpu = Actor()
-            actor_cpu.load_state_dict(self.actor.state_dict()) # important when resuming with a pretrained model
-            actor_cpu.share_memory()
-            
-            ep_queue = mp.Queue(maxsize=10) 
-            process__ = []
-       
-            for n in range(5):
-                step_thread = mp.Process(target=step, args=(ep_queue,actor_cpu,), daemon=True)
-                process__.append(step_thread)
-                step_thread.start()
+            self.pre_launch(run_id) # !!!
 
-            print_queue_loading(ep_queue)
-            
-            buffer = create_buffer() # init and share memory of tensors in buffer 
-            current_capacity = buffer[-1]
-            for tensor in buffer : 
-                tensor.share_memory_()
-
-            batch_queue = mp.Queue(maxsize=10)
-            filler_thread = Thread(target=filler,args=(buffer,ep_queue,run_id,),daemon=True)
-            filler_thread.start()
-
-            while not current_capacity.item() == 20:
-                print(current_capacity)
-                time.sleep(0.2)
-            
-            sampler_thread = Thread(target=sampler,args=(buffer,batch_queue,),daemon=True)
-            sampler_thread.start()
-       
             alpha = self.log_alpha.exp()
 
             for traj in tqdm(range(hypers.max_steps + 1),total=hypers.max_steps + 1):
-                states,nx_states,reward,terminated,actions = batch_queue.get()
+                states,nx_states,reward,terminated,actions = self.batch_queue.get()
                 # moving data to the gpu
                 states = states.to(hypers.device,dtype=torch.float)
                 nx_states = nx_states.to(hypers.device,dtype=torch.float)
@@ -317,7 +320,7 @@ class main:
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(),1.0)
                 self.actor.optim.step()
 
-                actor_cpu.load_state_dict(self.actor.state_dict()) # update cpu weights
+                self.actor_cpu.load_state_dict(self.actor.state_dict()) # update cpu weights
 
                 for p in self.q1.parameters() : p.requires_grad = True
                 for p in self.q2.parameters() : p.requires_grad = True
