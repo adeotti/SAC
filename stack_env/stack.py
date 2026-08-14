@@ -46,7 +46,7 @@ def create_storage(): # storage for the step env method where episodes steps are
     )
 
 
-def step(queue,policy,mean,var,count,stat_logger=False): # main method for stepping in the envs and collecting transitions 
+def step(queue,policy,goal): # main method for stepping in the envs and collecting transitions 
     with torch.no_grad():
         env = vec_env()
         stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()     
@@ -55,13 +55,14 @@ def step(queue,policy,mean,var,count,stat_logger=False): # main method for stepp
         obs = torch.from_numpy(env.reset()[0])
 
         while True:
-            if global_step < hypers.warmup:
+            if global_step < hypers.warmup: # TODO : reset wamup at the start of each goal 
                 action = env.action_space.sample()
             else:
-                action,_,_ = policy(torch.as_tensor(obs))
+                action,_,_ = policy(torch.as_tensor(obs)) # TODO pass the goal too 
                 action = action.squeeze()
-             
+            
             nx_state,reward,done,trunc,info = env.step(action.tolist())
+            # TODO extract the achived goal and replace reward to be goal specific
             
             saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
             
@@ -82,63 +83,6 @@ def step(queue,policy,mean,var,count,stat_logger=False): # main method for stepp
                 stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
         
         env.close()
-
-
-def create_buffer(): # buffer storage where many episode are stored for random sampling later
-    n_batch = torch.tensor(100) 
-    b_state = torch.zeros((n_batch,hypers.horizon,hypers.num_envs,hypers.obs_dim),dtype=torch.half)
-    b_nx_state = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,hypers.obs_dim,dtype=torch.half)
-    b_rewards = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,dtype=torch.half)
-    b_terminated = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,dtype=torch.bool)
-    b_actions = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,hypers.action_dim,dtype=torch.half)
-    current_capacity = torch.tensor(0)
-    return (n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity)
-
-
-def filler(buffer,ep_queue,mlflow_run_id): # method for filling the buffer
-    n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity = buffer
-    global_idx = 0
-
-    while True: 
-        ep_curr_state,ep_nx_state,ep_rewards,ep_terminated,ep_actions = ep_queue.get()
-            
-        p = global_idx % n_batch.item()
-
-        b_state[p].copy_(ep_curr_state)
-        b_nx_state[p].copy_(ep_nx_state)
-        b_rewards[p].copy_(ep_rewards)
-        b_terminated[p].copy_(ep_terminated)
-        b_actions[p].copy_(ep_actions)
-        
-        global_idx += 1
-        current_capacity.copy_(torch.tensor(min(global_idx, n_batch.item())))
-        
-        mean_return = ep_rewards.sum().item() / hypers.num_envs # tracking rewards per episodes
-        mlflow.log_metric("Main/mean reward",mean_return,run_id=mlflow_run_id,step=global_idx) 
-        
-
-def sampler(buffer,gpu_stream): # method for sampling from the buffer
-    n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity = buffer
- 
-    while True:
-        if current_capacity.item() < 20:
-            time.sleep(0.1)
-            continue
-        
-        idx_chunks = torch.randint(0,current_capacity,(hypers.batch_size,))
-        idx_horizons = torch.randint(0,hypers.horizon,(hypers.batch_size,))
-        idx_envs = torch.randint(0,hypers.num_envs,(hypers.batch_size,))
-
-        s_states = b_state[idx_chunks,idx_horizons,idx_envs]
-        s_nx_state = b_nx_state[idx_chunks,idx_horizons,idx_envs]
-        s_reward = b_rewards[idx_chunks,idx_horizons,idx_envs].unsqueeze(-1)
-        s_terminated = b_terminated[idx_chunks,idx_horizons,idx_envs].unsqueeze(-1)
-        s_actions = b_actions[idx_chunks,idx_horizons,idx_envs]
-        
-        try:
-            gpu_stream.put((s_states,s_nx_state,s_reward,s_terminated,s_actions),timeout=1.0)
-        except queue.Full:
-            continue
 
 
 class main:
@@ -235,7 +179,7 @@ class main:
             step=step
         )
     
-    def pre_launch(self,run_id):
+    def pre_launch(self,run_id): # create processes,threads and start prefilling the episodes and batch queues 
         self.load(model_path=None)
         self.actor_cpu = Actor()
         self.actor_cpu.load_state_dict(self.actor.state_dict()) # important when resuming with a pretrained model
@@ -245,8 +189,8 @@ class main:
         process__ = []
    
         for n in range(5):
-            step_thread = mp.Process(target=step, args=(ep_queue,actor_cpu,), daemon=True)
-            process__.append(step_thread)
+            step_process = mp.Process(target=step, args=(ep_queue,actor_cpu,), daemon=True)
+            process__.append(step_process)
             step_thread.start()
 
         print_queue_loading(ep_queue)
@@ -264,12 +208,12 @@ class main:
             print(current_capacity)
             time.sleep(0.2)
         
-        sampler_thread = Thread(target=sampler,args=(buffer,batch_queue,),daemon=True)
+        sampler_thread = Thread(target=sampler,args=(buffer,self.batch_queue,),daemon=True)
         sampler_thread.start()
 
 
     def train(self):
-        mlflow.set_experiment("sac-stack-Robosuite")
+        mlflow.set_experiment("sac-stack-robosuite")
         with mlflow.start_run() as run:
             run_id = run.info.run_id
 
