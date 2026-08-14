@@ -206,6 +206,35 @@ class main:
             self.log_alpha.data.copy_(check["log_alpha"].data)
             self.alpha_optim.load_state_dict(check["alpha optim state"])
 
+    
+    def log_metrics(self,
+        alpha_loss, 
+        alpha, 
+        alpha_log_action, 
+        min_q, new_action, 
+        policy_loss, 
+        action, 
+        alpha_log_nx_action, 
+        min_q_target
+        ):
+
+        mlflow.log_metrics(
+            {
+                "Main/entropy loss": alpha_loss.item(),
+                "Main/alpha value": alpha.item(),
+              
+                "policy/log action": alpha_log_action.item(),
+                "policy/pred min Q target": min_q.mean().item(),
+                "policy/new action variance": new_action.var().item(),
+                "policy/loss Policy": policy_loss.item(),
+                "policy/action variance": actions.var().item(),
+
+                "critic/alpha log nx action": alpha_log_nx_action.item(),
+                "critic/pred min Q target": min_q_target.mean().item(),
+            },
+            step=step
+        )
+
 
     def train(self):
         mlflow.set_experiment("sac-stack-Robosuite")
@@ -247,7 +276,6 @@ class main:
 
             for traj in tqdm(range(hypers.max_steps + 1),total=hypers.max_steps + 1):
                 states,nx_states,reward,terminated,actions = batch_queue.get()
-                
                 # moving data to the gpu
                 states = states.to(hypers.device,dtype=torch.float)
                 nx_states = nx_states.to(hypers.device,dtype=torch.float)
@@ -306,23 +334,22 @@ class main:
                     self.save(self.n)
 
                 if traj > 0 and traj % int(1e3) == 0 :
-                    mlflow.log_metrics(
-                        {
-                            "Main/entropy loss" : alpha_loss.item(),
-                            "Main/alpha value" : alpha.item(),
-                          
-                            "policy/log action" : (alpha * log_pi).mean().item(),
-                            "policy/pred min Q target" : min_q.mean().item(),
-                            "policy/policy loss action variance" : new_action.var().item(),
-                            "policy/loss Policy" : policy_loss.item(),
-                            "policy/action variance" : actions.var().item(),
+                    alpha_log_action = (alpha * log_pi).mean()
+                    alpha_log_nx_actions = (alpha * log_nx_actions).mean()
 
-                            "critic/log action" : (alpha * log_nx_actions).mean().item(),
-                            "critic/pred min Q target" : min_q_target.mean().item(),
-                        },
-                        step = traj
+                    self.log_metrics(
+                        alpha_loss, 
+                        alpha, 
+                        alpha_log_action, 
+                        min_q, 
+                        new_action, 
+                        policy_loss, 
+                        action, 
+                        alpha_log_nx_action, 
+                        min_q_target
                     )
-                        
+
+                                            
 
 if __name__ == "__main__": 
     mp.set_start_method("spawn",force=True)
