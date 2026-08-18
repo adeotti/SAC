@@ -377,9 +377,6 @@ class main:
                     for q2_pars,q2_target_pars in zip(self.q2.parameters(),self.q2_target.parameters()):
                         q2_target_pars.data.mul_(1.0 - hypers.tau).add_(q2_pars.data,alpha=hypers.tau)
                     
-                    for p in self.q1.parameters() : p.requires_grad = False
-                    for p in self.q2.parameters() : p.requires_grad = False
-
                     new_action,log_pi,_ = self.actor(states)
                     min_q = torch.min(self.q1(states,new_action),self.q2(states,new_action))
                     policy_loss = ((alpha.detach() * log_pi) -  min_q).mean() # alpla * log policy(at|st) - Q(st,at)
@@ -390,9 +387,6 @@ class main:
                     self.actor.optim.step()
 
                     actor_cpu.load_state_dict(self.actor.state_dict()) # !!
-
-                    for p in self.q1.parameters() : p.requires_grad = True
-                    for p in self.q2.parameters() : p.requires_grad = True
 
                     # Entropy auto tune 
                     alpha_loss = (self.log_alpha * (-log_pi - self.entropy_target).detach()).mean()
