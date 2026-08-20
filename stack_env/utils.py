@@ -72,18 +72,9 @@ def create_buffer(): # circular buffer
 
 def step_envs(queue, hlp, llp): # episode collection method  
     with torch.no_grad():
+        stor_curr_states, stor_nx_states, stor_rewards, stor_local_rewards, stor_dones, stor_actions, stor_hl_goals, stor_obs_goals = create_storage()
+    
         env = vec_env()
-        (
-            stor_curr_states,
-            stor_nx_states,
-            stor_rewards,
-            stor_local_rewards,
-            stor_dones,
-            stor_actions,
-            stor_hl_goals,
-            stor_obs_goals,
-        ) = create_storage()
-
         pointer = 0
         global_step = 0
         obs = torch.from_numpy(env.reset()[0])
@@ -150,9 +141,7 @@ def filler(buffer, episodes_queue, mlflow_run_id): # method used by a wroker to 
         current_capacity.copy_(torch.tensor(min(global_idx, n_batch)))
         
         mean_return = ep_rewards.sum().item() / hypers.num_envs # tracking rewards per episodes
-        mlflow.log_metric("Main/mean reward",mean_return,run_id=mlflow_run_id,step=global_idx) 
-
-        print(current_capacity,flush=True)
+        mlflow.log_metric("Main/mean reward", mean_return,run_id=mlflow_run_id, step=global_idx) 
         
 
 def sampler(buffer,gpu_stream): # method for sampling from the buffer
