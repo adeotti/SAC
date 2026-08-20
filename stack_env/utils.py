@@ -1,14 +1,81 @@
 from tqdm import tqdm
+import torch
+from configs import hypers
 
-def create_buffer(): # buffer storage where many episode are stored for random sampling later
-    n_batch = torch.tensor(100) 
-    b_state = torch.zeros((n_batch,hypers.horizon,hypers.num_envs,hypers.obs_dim),dtype=torch.half)
-    b_nx_state = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,hypers.obs_dim,dtype=torch.half)
-    b_rewards = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,dtype=torch.half)
-    b_terminated = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,dtype=torch.bool)
-    b_actions = torch.zeros(n_batch,hypers.horizon,hypers.num_envs,hypers.action_dim,dtype=torch.half)
-    current_capacity = torch.tensor(0)
-    return (n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity)
+
+__all__ = ["create_storage", "create_buffer"]
+
+
+def create_storage(): # for episodic data storage
+    obs_dim = (hypers.num_envs,hypers.obs_dim)     
+    act_dim = (hypers.num_envs,hypers.ll_action_dim)
+    return (
+        torch.empty((hypers.horizon, *obs_dim), dtype=torch.half),  # states
+        torch.empty((hypers.horizon, *obs_dim), dtype=torch.half),  # nx states
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.half),  # environment reward
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.half),  # local reward (L2 norm)
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.bool),  # done
+        torch.empty((hypers.horizon, *act_dim), dtype=torch.half),  # actions
+        torch.empty((hypers.horizon, hypers.num_envs, 6), dtype=torch.half),  # hl goal 
+        torch.empty((hypers.horizon, hypers.num_envs, 6), dtype=torch.half)  # observed goal
+    )
+
+
+def create_buffer(): # circular buffer 
+    n_batch = torch.tensor(hypers.buffer_size) 
+    obs_dim = (hypers.num_envs, hypers.obs_dim)
+    act_dim = (hypers.num_envs, hypers.ll_action_dim)
+    goal_dim = (hypers.num_envs, hypers.hl_action_dim)
+    return (
+        torch.zeros((n_batch, hypers.horizon, *obs_dim), dtype=torch.half),  # states
+        torch.zeros((n_batch, hypers.horizon, *obs_dim), dtype=torch.half),  # nx states
+        torch.zeros((n_batch, hypers.horizon, hypers.num_envs), dtype=torch.half),  # environment rewards
+        torch.zeros((n_batch, hypers.horizon, hypers.num_envs), dtype=torch.half),  # local rewards
+        torch.zeros((n_batch, hypers.horizon, hypers.num_envs,), dtype=torch.bool),  # done
+        torch.zeros((n_batch, hypers.horizon, *act_dim), dtype=torch.half),  # actions
+        torch.zeros((n_batch, hypers.horizon, *goal_dim), dtype=torch.half),  # hl goals
+        torch.zeros((n_batch, hypers.horizon, *goal_dim), dtype=torch.half),  # observed goals
+        torch.tensor(0)  # current buffer capacity
+    ) 
+
+
+def step_envs(queue,policy,goal): # episode collection method  
+    with torch.no_grad():
+        env = vec_env()
+        stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()     
+        pointer = 0
+        global_step = 0
+        obs = torch.from_numpy(env.reset()[0])
+
+        while True:
+            if global_step < hypers.warmup: 
+                action = env.action_space.sample()
+            else:
+                action,_,_ = policy(torch.as_tensor(obs)) # TODO pass the goal too 
+                action = action.squeeze()
+            
+            nx_state,reward,done,trunc,info = env.step(action.tolist())
+            # TODO extract the achived goal and replace reward to be goal specific
+            
+            saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
+            
+            stor_curr_states[pointer].copy_(torch.as_tensor(obs))
+            stor_nx_states[pointer].copy_(torch.as_tensor(nx_state))
+            stor_rewards[pointer].copy_(torch.from_numpy(reward))
+            stor_terminated[pointer].copy_(torch.from_numpy(done))
+            stor_actions[pointer].copy_(saved_action)
+
+            obs = nx_state
+            pointer+=1
+            global_step += 1
+
+            if pointer == hypers.horizon:
+                data = (stor_curr_states.clone(),stor_nx_states.clone(),stor_rewards.clone(),stor_terminated.clone(),stor_actions.clone())
+                queue.put(data)
+                pointer = 0 
+                stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
+        
+        env.close()
 
 
 def filler(buffer,ep_queue,mlflow_run_id): # method for filling the buffer
