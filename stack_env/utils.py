@@ -1,9 +1,14 @@
+import robosuite
+from robosuite.wrappers.gym_wrapper import GymWrapper
+from gymnasium.vector import SyncVectorEnv
+from gymnasium.wrappers.common import Autoreset
+
 from tqdm import tqdm
 import torch
 from configs import hypers
 
 
-__all__ = ["create_storage", "create_buffer"]
+__all__ = ["step_envs"]
 
 
 def vec_env(): # environment creation 
@@ -83,41 +88,47 @@ def step_envs(queue,hlp,llp): # episode collection method
         obs = torch.from_numpy(env.reset()[0])
 
         while True:
-            hl_goal,_,_ = self.hlp(state) # sample goal 
+            hl_goal,_,_ = hlp(obs) # sample goal with high level policy 
 
             for n in range(hypers.horizon):
                 if global_step < hypers.warmup: 
                     action = env.action_space.sample()
                 else:
-                    action,_,_ = policy(torch.as_tensor(obs)) 
+                    action,_,_ = llp(torch.as_tensor(obs)) 
                     action = action.squeeze()
                 
                 nx_state,env_reward,done,trunc,info = env.step(action.tolist())
-                local_reward,obs_goal = get_local_reward(env, hl_goal.cpu())
+                local_reward,obs_goal = get_local_reward(env, hl_goal)
                 
                 saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
                 
-                stor_curr_states[pointer].copy_(torch.as_tensor(state))
-                stor_nx_states[pointer].copy_(torch.as_tensor(nx_state))
-                stor_rewards[pointer].copy_(torch.from_numpy(env_reward))
-                stor_local_reward[pointer].copy_(local_reward)
-                stor_terminated[pointer].copy_(torch.from_numpy(done))
-                stor_actions[pointer].copy_(saved_action)
-                stor_hl_goal[pointer].copy_(hl_goal)
-                stor_obs_goal[pointer].copy_(obs_goal)
+                stor_curr_states[n].copy_(torch.as_tensor(state))
+                stor_nx_states[n].copy_(torch.as_tensor(nx_state))
+                stor_rewards[n].copy_(torch.from_numpy(env_reward))
+                stor_local_reward[n].copy_(local_reward)
+                stor_terminated[n].copy_(torch.from_numpy(done))
+                stor_actions[n].copy_(saved_action)
+                stor_hl_goals[n].copy_(hl_goal)
+                stor_obs_goals[n].copy_(obs_goal)
 
                 obs = nx_state
-                pointer+=1
+                pointer +=1
                 global_step += 1
 
-                if pointer == hypers.horizon:
-                    data = (stor_curr_states.clone(),stor_nx_states.clone(),stor_rewards.clone(),stor_terminated.clone(),stor_actions.clone())
+                if n % hypers.horizon == 0:
+                    data = (
+                        stor_curr_states.clone(),
+                        stor_nx_states.clone(),
+                        stor_rewards.clone(),
+                        stor_local_rewards.clone(),
+                        stor_terminated.clone(),
+                        stor_actions.clone(),
+                        stor_hl_goals.clone(),
+                        stor_obs_goals.clone()
+                    )
                     queue.put(data)
                     pointer = 0 
-                    stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
-            
-        env.close()
-
+                                
 
 def filler(buffer,ep_queue,mlflow_run_id): # method for filling the buffer
     n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity = buffer
