@@ -3,13 +3,13 @@ from robosuite.wrappers.gym_wrapper import GymWrapper
 from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers.common import Autoreset
 
-from tqdm import tqdm
 import torch
+import mlflow
 import numpy as np
 from configs import *
+from tqdm import tqdm
 
-
-__all__ = ["step_envs"]
+__all__ = ["step_envs", "create_buffer", "filler"]
 
 
 def vec_env(): # environment creation 
@@ -82,7 +82,7 @@ def step_envs(queue, hlp, llp): # episode collection method
             stor_actions,
             stor_hl_goals,
             stor_obs_goals,
-            ) = create_storage()
+        ) = create_storage()
 
         pointer = 0
         global_step = 0
@@ -127,26 +127,32 @@ def step_envs(queue, hlp, llp): # episode collection method
                     queue.put(data)
                  
 
-def filler(buffer,ep_queue,mlflow_run_id): # method for filling the buffer
-    n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity = buffer
+def filler(buffer, episodes_queue, mlflow_run_id): # method used by a wroker to fill the buffer 
+    b_state, b_nx_state, b_rewards, b_local_rewards, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = buffer
+    n_batch = hypers.buffer_size
     global_idx = 0
 
     while True: 
-        ep_curr_state,ep_nx_state,ep_rewards,ep_terminated,ep_actions = ep_queue.get()
-            
-        p = global_idx % n_batch.item()
+        ep_curr_states, ep_nx_states, ep_rewards, ep_local_rewards, ep_dones, ep_actions, ep_hl_goals, ep_obs_goals = episodes_queue.get()
 
-        b_state[p].copy_(ep_curr_state)
-        b_nx_state[p].copy_(ep_nx_state)
+        p = global_idx % n_batch
+
+        b_state[p].copy_(ep_curr_states)
+        b_nx_state[p].copy_(ep_nx_states)
         b_rewards[p].copy_(ep_rewards)
-        b_terminated[p].copy_(ep_terminated)
+        b_local_rewards[p].copy_(ep_local_rewards)
+        b_dones[p].copy_(ep_dones)
         b_actions[p].copy_(ep_actions)
+        b_hl_goals[p].copy_(ep_hl_goals)
+        b_obs_goals[p].copy_(ep_obs_goals)
         
         global_idx += 1
-        current_capacity.copy_(torch.tensor(min(global_idx, n_batch.item())))
+        current_capacity.copy_(torch.tensor(min(global_idx, n_batch)))
         
         mean_return = ep_rewards.sum().item() / hypers.num_envs # tracking rewards per episodes
         mlflow.log_metric("Main/mean reward",mean_return,run_id=mlflow_run_id,step=global_idx) 
+
+        print(current_capacity,flush=True)
         
 
 def sampler(buffer,gpu_stream): # method for sampling from the buffer
