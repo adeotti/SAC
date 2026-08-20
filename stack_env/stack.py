@@ -7,19 +7,19 @@ from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers.common import Autoreset
 
 import torch
+import torch.nn.functional as F
 from torch.optim import Adam
-import torch.multiprocessing as mp
 import numpy as np
 
-import sys,time,mlflow,queue
+import sys
+import mlflow
+import queue
 from copy import deepcopy
 from tqdm import tqdm
 from itertools import chain
 from threading import Thread
 
-from goals import *
-from utils import *
-from networks import HL,LL,Critic
+from networks import *
 from configs import hypers,env_configs
 
 
@@ -34,271 +34,232 @@ def vec_env():
     return env
 
 
+def get_local_reward(env,hl_goal): # TODO : review math
+    mujoco_layer = env.unwrapped
+    data_list = []
+    for env in mujoco_layer.envs:
+        cubeA_pos = env.unwrapped._get_observations()["cubeA_pos"]
+        gripper_to_cubeA = env.unwrapped._get_observations()["gripper_to_cubeA"]
+        stack = torch.cat([torch.from_numpy(cubeA_pos),torch.from_numpy(gripper_to_cubeA)])
+        data_list.append(stack) 
+
+    obs_goal = torch.stack(data_list,dim=0).float() # each env data are on the x axis
+    diff = torch.linalg.norm((hl_goal-obs_goal),dim=-1)
+    return diff.mean(), obs_goal
+
+
 def create_storage(): # storage for the step env method where episodes steps are stored
     obs_dim = (hypers.num_envs,hypers.obs_dim)     
-    act_dim = (hypers.num_envs,hypers.action_dim)
+    act_dim = (hypers.num_envs,hypers.ll_action_dim)
     return (
-        torch.empty((hypers.horizon,*obs_dim),dtype=torch.half),
-        torch.empty((hypers.horizon,*obs_dim),dtype=torch.half),
-        torch.empty((hypers.horizon,hypers.num_envs,),dtype=torch.half),
-        torch.empty((hypers.horizon,hypers.num_envs,),dtype=torch.bool),
-        torch.empty((hypers.horizon,*act_dim),dtype=torch.half) 
+        torch.empty((hypers.horizon, *obs_dim), dtype=torch.half), # states
+        torch.empty((hypers.horizon, *obs_dim), dtype=torch.half), # nx states
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.half), # reward
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.half), # local reward 
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.bool), # done
+        torch.empty((hypers.horizon, *act_dim), dtype=torch.half), # actions
+        torch.empty((hypers.horizon, hypers.num_envs, 6), dtype=torch.half), # hl goal 
+        torch.empty((hypers.horizon, hypers.num_envs, 6), dtype=torch.half) # observed goal
     )
-
-
-def step(queue,policy,goal): # main method for stepping in the envs and collecting transitions 
-    with torch.no_grad():
-        env = vec_env()
-        stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()     
-        pointer = 0
-        global_step = 0
-        obs = torch.from_numpy(env.reset()[0])
-
-        while True:
-            if global_step < hypers.warmup: # TODO : reset wamup at the start of each goal 
-                action = env.action_space.sample()
-            else:
-                action,_,_ = policy(torch.as_tensor(obs)) # TODO pass the goal too 
-                action = action.squeeze()
-            
-            nx_state,reward,done,trunc,info = env.step(action.tolist())
-            # TODO extract the achived goal and replace reward to be goal specific
-            
-            saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
-            
-            stor_curr_states[pointer].copy_(torch.as_tensor(obs))
-            stor_nx_states[pointer].copy_(torch.as_tensor(nx_state))
-            stor_rewards[pointer].copy_(torch.from_numpy(reward))
-            stor_terminated[pointer].copy_(torch.from_numpy(done))
-            stor_actions[pointer].copy_(saved_action)
-
-            obs = nx_state
-            pointer+=1
-            global_step += 1
-
-            if pointer == hypers.horizon:
-                data = (stor_curr_states.clone(),stor_nx_states.clone(),stor_rewards.clone(),stor_terminated.clone(),stor_actions.clone())
-                queue.put(data)
-                pointer = 0 
-                stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
-        
-        env.close()
 
 
 class main:
     def __init__(self,storage_path):
-        self.hlp = HL().to(hypers.device)  # high level policy
-        
-        self.actor = LL().to(hypers.device) # low level policy
-        self.q1 = Critic().to(hypers.device)
-        self.q2 = Critic().to(hypers.device)
+        self.env = vec_env()
 
-        self.q1_target = deepcopy(self.q1).to(hypers.device)
-        self.q2_target = deepcopy(self.q2).to(hypers.device)
+        self.hlp = HL().to(hypers.device)  # high level policy
+        self.qh1 = HL_Critic().to(hypers.device)
+        self.qh2 = HL_Critic().to(hypers.device)
+        self.qh1_target = deepcopy(self.qh1).to(hypers.device)
+        self.qh2_target = deepcopy(self.qh2).to(hypers.device)
+                
+        self.llp = LL().to(hypers.device) # low level policy
+        self.ql1 = LL_Critic().to(hypers.device)
+        self.ql2 = LL_Critic().to(hypers.device)
+        self.ql1_target = deepcopy(self.ql1).to(hypers.device)
+        self.ql2_target = deepcopy(self.ql2).to(hypers.device)
+                
+        self.hlp_optim = Adam(self.hlp.parameters(),lr=0.0001)
+        self.llp_optim = Adam(self.llp.parameters(),lr=0.0001)
+        self.qh_optim = Adam(chain(self.qh1.parameters(),self.qh2.parameters()),lr=0.001,fused=True)
+        self.ql_optim = Adam(chain(self.ql1.parameters(),self.ql2.parameters()),lr=0.001,fused=True)
+
+        #self.compile_()
         
-        self.hlp.compile(mode="max-autotune")
-        self.actor.compile(mode="max-autotune")
-        self.q1.compile()
-        self.q2.compile()
-        self.q1_target.compile()
-        self.q2_target.compile()
-        
-        self.hlp_optim = Adam(self.hlp.parameters(),lr=hypers.lr)
-        self.actor_optim = Adam(self.actor.parameters(),lr=hypers.lr)
-        self.q_optim = Adam(chain(self.q1.parameters(),self.q2.parameters()),lr=hypers.lr,fused=True)
-    
-        self.entropy_target = -hypers.action_dim
-        self.log_alpha = torch.tensor(1.0,requires_grad=True,device=hypers.device)  
-        self.alpha_optim = Adam([self.log_alpha],lr=hypers.lr)
+        self.hl_entropy_target = -hypers.hl_action_dim
+        self.hl_log_alpha = torch.tensor(1.0,requires_grad=True,device=hypers.device)  
+        self.hl_alpha_optim = Adam([self.hl_log_alpha],lr=hypers.lr)
+
+        self.ll_entropy_target = -hypers.ll_action_dim
+        self.ll_log_alpha = torch.tensor(1.0,requires_grad=True,device=hypers.device)  
+        self.ll_alpha_optim = Adam([self.ll_log_alpha],lr=hypers.lr)
         
         self.storage_path = storage_path
         self.n = 0 # tracking number for model data saving  
+
+    def compile_(self):
+        self.hlp.compile(mode="max-autotune")
+        self.qh1.compile()
+        self.qh2.compile()
+        self.qh1_target.compile()
+        self.qh2_target.compile()
+        
+        self.actor.compile(mode="max-autotune")
+        self.ql1.compile()
+        self.ql2.compile()
+        self.ql1_target.compile()
+        self.ql2_target.compile()
             
-    
     def save(self, step):
         check = {
             "high level state": self.hlp.state_dict(),
-            "actor state": self.actor.state_dict(), 
-            "q1 state": self.q1.state_dict(),
-            "q1 target": self.q1_target.state_dict(),
-            "q2 state": self.q2.state_dict(),
-            "q2 target": self.q2_target.state_dict(),
-            
-            "self.high level optim state": self.hlp_optim.state_dict(),
-            "actor optim state" : self.actor.optim.state_dict(),
-            "alpha optim state": self.alpha_optim.state_dict(),
-
-            "log_alpha": self.log_alpha,
-         }
+            "low level state": self.actor.state_dict(),             
+        }
         torch.save(check,f"{self.storage_path}{step}.pth")
 
+    def compute_q_target(self,q1, q2, nx_actions, log_nx_actions, nx_states, obs_goals, reward, terminated, alpha):
+        min_q_target = torch.min(q1,q2).squeeze()
+        q_target = reward.squeeze() + hypers.gamma * (1-terminated) * (min_q_target - alpha.detach() * log_nx_actions.squeeze()) 
+        return q_target
     
-    def load(self, model_path=None, strict=True):
-        if model_path is not None:
-            check = torch.load(model_path, weights_only=False, map_location=hypers.device)
-            self.hlp_optim.load_state_dict(check["high level optim state"], strict)
-            self.actor.load_state_dict(check["actor state"], strict)
-            self.q1.load_state_dict(check["q1 state"],strict)
-            self.q1_target.load_state_dict(check["q1 target"], strict)
-            self.q2.load_state_dict(check["q2 state"], strict)
-            self.q2_target.load_state_dict(check["q2 target"], strict)
-            
-            self.actor.optim.load_state_dict(check["actor optim state"])
-            self.q1_optim.load_state_dict(check["q1 optim state"])
-            self.q2_optim.load_state_dict(check["q2 optim state"])
-
-            self.log_alpha.data.copy_(check["log_alpha"].data)
-            self.alpha_optim.load_state_dict(check["alpha optim state"])
-
+    def update_critics(self, q1_pred, q2_pred, q_target, optim):
+        loss = F.smooth_l1_loss(q1_pred, q_target) + F.smooth_l1_loss(q2_pred, q_target) 
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        optim.step() 
+        return loss
     
-    def log_metrics(self,
-        alpha_loss, 
-        alpha, 
-        alpha_log_action, 
-        min_q, new_action, 
-        policy_loss, 
-        action, 
-        alpha_log_nx_action, 
-        min_q_target
-        ):
+    def soft_update(self, q1, q2, q1_target, q2_target):
+        for q1_pars,q1_target_pars in zip(q1.parameters(), q1_target.parameters()):
+            q1_target_pars.data.mul_(1.0 - hypers.tau).add_(q1_pars.data,alpha=hypers.tau)
+                
+        for q2_pars,q2_target_pars in zip(q2.parameters(), q2_target.parameters()):
+            q2_target_pars.data.mul_(1.0 - hypers.tau).add_(q2_pars.data,alpha=hypers.tau)
 
-        mlflow.log_metrics(
-            {
-                "Main/entropy loss": alpha_loss.item(),
-                "Main/alpha value": alpha.item(),
-              
-                "policy/log action": alpha_log_action.item(),
-                "policy/pred min Q target": min_q.mean().item(),
-                "policy/new action variance": new_action.var().item(),
-                "policy/loss Policy": policy_loss.item(),
-                "policy/action variance": actions.var().item(),
+    def update_policy(self, q1, q2, alpha, log_pi, optim):
+        min_q = torch.min(q1,q2)
+        loss = ((alpha.detach()*log_pi.squeeze()) -  min_q).mean() 
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        optim.step()
+        return loss
 
-                "critic/alpha log nx action": alpha_log_nx_action.item(),
-                "critic/pred min Q target": min_q_target.mean().item(),
-            },
-            step=step
-        )
-    
-    def pre_launch(self,run_id): # create processes,threads and start prefilling the episodes and batch queues 
-        self.load(model_path=None)
-        self.actor_cpu = Actor()
-        self.actor_cpu.load_state_dict(self.actor.state_dict()) # important when resuming with a pretrained model
-        self.actor_cpu.share_memory()
-        
-        ep_queue = mp.Queue(maxsize=10) 
-        process__ = []
-   
-        for n in range(5):
-            step_process = mp.Process(target=step, args=(ep_queue,actor_cpu,), daemon=True)
-            process__.append(step_process)
-            step_thread.start()
-
-        print_queue_loading(ep_queue)
-        
-        buffer = create_buffer() # init and share memory of tensors in buffer 
-        current_capacity = buffer[-1]
-        for tensor in buffer : 
-            tensor.share_memory_()
-
-        self.batch_queue = mp.Queue(maxsize=10)
-        filler_thread = Thread(target=filler,args=(buffer,ep_queue,run_id,),daemon=True)
-        filler_thread.start()
-
-        while not current_capacity.item() == 20:
-            print(current_capacity)
-            time.sleep(0.2)
-        
-        sampler_thread = Thread(target=sampler,args=(buffer,self.batch_queue,),daemon=True)
-        sampler_thread.start()
-
+    def tune_alpha(self, log_alpha, log_pi, entropy_target, optim):
+        alpha_loss = (log_alpha * (-log_pi - entropy_target).detach()).mean()
+        optim.zero_grad(set_to_none=True)
+        alpha_loss.backward() 
+        optim.step()
+        alpha = log_alpha.exp()
+        return alpha
 
     def train(self):
         mlflow.set_experiment("sac-stack-robosuite")
         with mlflow.start_run() as run:
-            run_id = run.info.run_id
+    
+            ll_alpha = self.ll_log_alpha.exp()
+            hl_alpha = self.hl_log_alpha.exp()
+            state = torch.from_numpy(self.env.reset()[0]).to(hypers.device,dtype=torch.float)
 
-            self.pre_launch(run_id) # !!!
+            for c in tqdm(range(1000),total=1000):
+                hl_goal,_,_ = self.hlp(state) # sample goal 
+                    
+                stor_curr_states, stor_nx_states, stor_rewards, stor_local_reward, \
+                stor_terminated, stor_actions, stor_hl_goal, stor_obs_goal = create_storage()     
 
-            alpha = self.log_alpha.exp()
+                pointer = 0
+                global_step = 0  
+                for n in range(50): # 500
+                    with torch.no_grad():
+                        if global_step < hypers.warmup:  
+                            action = self.env.action_space.sample()
+                        else:
+                            action,_,_ = self.llp(torch.as_tensor(state),hl_goal)
+                            action = action.squeeze()
+                        
+                        nx_state,env_reward,done,trunc,info = self.env.step(action.tolist())
+                        reward,obs_goal = get_local_reward(self.env, hl_goal.cpu())
+                        reward -= reward
+                        
+                        saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
+                        
+                        stor_curr_states[pointer].copy_(torch.as_tensor(state))
+                        stor_nx_states[pointer].copy_(torch.as_tensor(nx_state))
+                        stor_rewards[pointer].copy_(torch.from_numpy(env_reward))
+                        stor_local_reward[pointer].copy_(reward)
+                        stor_terminated[pointer].copy_(torch.from_numpy(done))
+                        stor_actions[pointer].copy_(saved_action)
+                        stor_hl_goal[pointer].copy_(hl_goal)
+                        stor_obs_goal[pointer].copy_(obs_goal)
 
-            for traj in tqdm(range(hypers.max_steps + 1),total=hypers.max_steps + 1):
-                states,nx_states,reward,terminated,actions = self.batch_queue.get()
-                # moving data to the gpu
-                states = states.to(hypers.device,dtype=torch.float)
-                nx_states = nx_states.to(hypers.device,dtype=torch.float)
-                reward = reward.to(hypers.device,dtype=torch.float)
-                terminated = terminated.to(hypers.device,dtype=torch.float)
-                actions = actions.to(hypers.device,dtype=torch.float)
+                        obs = nx_state
+                        pointer+=1
+                        global_step += 1
 
-                with torch.no_grad():
-                    nx_actions,log_nx_actions,_ = self.actor(nx_states)
-                    min_q_target = torch.min(self.q1_target(nx_states,nx_actions),self.q2_target(nx_states,nx_actions))
-                    q_target = reward + hypers.gamma * (1-terminated) * (min_q_target - alpha.detach() * log_nx_actions)
-                    # R(st|at) + gamma * (Q(st,at) - alpha * log pi(at|st))
-                 
-                q1_pred = self.q1(states,actions) 
-                q2_pred = self.q2(states,actions)
+                for n in range(50):
+                    idx = torch.randperm(50)
+                    _states = stor_curr_states[idx].to(hypers.device,dtype=torch.float)
+                    _nx_states = stor_nx_states[idx].to(hypers.device,dtype=torch.float)
+                    _local_reward = stor_local_reward[idx].to(hypers.device,dtype=torch.float).squeeze()
+                    _terminated = stor_terminated[idx].to(hypers.device,dtype=torch.float)
+                    _actions = stor_actions[idx].to(hypers.device,dtype=torch.float)
+                    _hl_goals = stor_hl_goal[idx].to(hypers.device,dtype=torch.float)
+                    _obs_goals = stor_obs_goal[idx].to(hypers.device,dtype=torch.float)
+                    
+                    with torch.no_grad(): # -||s_t + g_t - s_t+1||_2 + gamma * (min(Q_(1,2)(st+1,gt+1,at+1)) - alpha * log pi(at+1|st+1,g_t+1))
+                        nx_actions,log_nx_actions,_ = self.llp(_nx_states,_obs_goals)
+                        q1 = self.ql1_target(_nx_states,nx_actions,_obs_goals)
+                        q2 = self.ql2_target(_nx_states,nx_actions,_obs_goals)
+                        q_target = self.compute_q_target(q1, q2, nx_actions, log_nx_actions, _nx_states, _obs_goals, _local_reward, _terminated, ll_alpha)
+                                         
+                    q1_pred = self.ql1(_states,_actions,_hl_goals).squeeze() 
+                    q2_pred = self.ql2(_states,_actions,_hl_goals).squeeze()
+                    ll_q_loss = self.update_critics(q1_pred, q2_pred, q_target, self.llp_optim) 
 
-                loss = F.smooth_l1_loss(q1_pred,q_target) + F.smooth_l1_loss(q2_pred,q_target) 
-                self.q_optim.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(chain(self.q1.parameters(),self.q2.parameters()),1.0)
-                self.q_optim.step() 
+                    self.soft_update(self.ql1, self.ql2, self.ql1_target, self.ql2_target) # q targets update
+                    
+                    new_action,log_pi,_ = self.llp(_states,_hl_goals)
+                    q1 = self.ql1(_states,new_action,_hl_goals).squeeze()
+                    q2 = self.ql2(_states,new_action,_hl_goals).squeeze()
+                    ll_policy_loss = self.update_policy(q1, q2, ll_alpha, log_pi, self.llp_optim) # alpla * log policy(at|st,g_t) - min(Q_(1,2)(st,g_t,at))
 
-                for q1_pars,q1_target_pars in zip(self.q1.parameters(),self.q1_target.parameters()):
-                    q1_target_pars.data.mul_(1.0 - hypers.tau).add_(q1_pars.data,alpha=hypers.tau)
-            
-                for q2_pars,q2_target_pars in zip(self.q2.parameters(),self.q2_target.parameters()):
-                    q2_target_pars.data.mul_(1.0 - hypers.tau).add_(q2_pars.data,alpha=hypers.tau)
-                
-                # freezing critcs weights
-                for p in self.q1.parameters() : p.requires_grad = False
-                for p in self.q2.parameters() : p.requires_grad = False
+                    ll_alpha = self.tune_alpha(self.ll_log_alpha, log_pi, self.ll_entropy_target, self.ll_alpha_optim) 
 
-                new_action,log_pi,_ = self.actor(states)
-                min_q = torch.min(self.q1(states,new_action),self.q2(states,new_action))
-                policy_loss = ((alpha.detach() * log_pi) -  min_q).mean() # alpla * log policy(at|st) - Q(st,at)
-                
-                self.actor.optim.zero_grad(set_to_none=True)
-                policy_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(),1.0)
-                self.actor.optim.step()
+                for n in range(5):
+                    idx = torch.randperm(50)
+                    _states = stor_curr_states[idx].to(hypers.device,dtype=torch.float)
+                    _nx_states = stor_nx_states[idx].to(hypers.device,dtype=torch.float)
+                    _reward = stor_rewards[idx].to(hypers.device,dtype=torch.float).squeeze() # env reward
+                    _terminated = stor_terminated[idx].to(hypers.device,dtype=torch.float)
+                    _actions = stor_actions[idx].to(hypers.device,dtype=torch.float)
+                    _hl_goals = stor_hl_goal[idx].to(hypers.device,dtype=torch.float)
+                    _obs_goals = stor_obs_goal[idx].to(hypers.device,dtype=torch.float)
+                    
+                    # TODO : goal relabelling       
 
-                self.actor_cpu.load_state_dict(self.actor.state_dict()) # update cpu weights
+                    with torch.no_grad():
+                        nx_actions,log_nx_actions,_ = self.hlp(_nx_states)
+                        q1 = self.qh1_target(_nx_states,_obs_goals)
+                        q2 = self.qh2_target(_nx_states,_obs_goals)
+                        q_target = self.compute_q_target(q1, q2, nx_actions, log_nx_actions, _nx_states, _obs_goals, _reward, _terminated, hl_alpha)
+             
+                    q1_pred = self.qh1(_states,_hl_goals).squeeze()
+                    q2_pred = self.qh2(_states,_hl_goals).squeeze()
+                    hl_q_loss = self.update_critics(q1_pred, q2_pred, q_target, self.hlp_optim) 
 
-                for p in self.q1.parameters() : p.requires_grad = True
-                for p in self.q2.parameters() : p.requires_grad = True
+                    self.soft_update(self.qh1, self.qh2, self.qh1_target, self.qh2_target) # q targets update
+                    
+                    new_action,log_pi,_ = self.hlp(_states)
+                    q1 = self.qh1(_states,new_action).squeeze()
+                    q2 = self.qh2(_states,new_action).squeeze()
+                    hl_policy_loss = self.update_policy(q1, q2, hl_alpha, log_pi, self.hlp_optim) 
 
-                # Entropy auto tune 
-                alpha_loss = (self.log_alpha * (-log_pi - self.entropy_target).detach()).mean()
-                self.alpha_optim.zero_grad(set_to_none=True)
-                alpha_loss.backward() 
-                self.alpha_optim.step()
-                alpha = self.log_alpha.exp()
+                    hl_alpha = self.tune_alpha(self.hl_log_alpha, log_pi, self.hl_entropy_target, self.hl_alpha_optim)
 
-                if traj > 0 and traj % int(20e3) == 0 :
-                    self.n+=1
-                    self.save(self.n)
-
-                if traj > 0 and traj % int(1e3) == 0 :
-                    alpha_log_action = (alpha * log_pi).mean()
-                    alpha_log_nx_actions = (alpha * log_nx_actions).mean()
-
-                    self.log_metrics(
-                        alpha_loss, 
-                        alpha, 
-                        alpha_log_action, 
-                        min_q, 
-                        new_action, 
-                        policy_loss, 
-                        action, 
-                        alpha_log_nx_action, 
-                        min_q_target
-                    )
-
-                                            
+                #state = None # TODO update new state from data 
+        
+                if c > 0 and c % int(20e3) == 0 :
+                    self.n+=1 ; self.save(self.n)
+               
 
 if __name__ == "__main__": 
-    mp.set_start_method("spawn",force=True)
-    mp.set_sharing_strategy("file_system")
-    main(storage_path="./").train(True)
+    main(storage_path="./").train()
