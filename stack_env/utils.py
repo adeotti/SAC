@@ -6,6 +6,20 @@ from configs import hypers
 __all__ = ["create_storage", "create_buffer"]
 
 
+def get_local_reward(env,hl_goal): # TODO : review math
+    mujoco_layer = env.unwrapped
+    data_list = []
+    for env in mujoco_layer.envs:
+        cubeA_pos = env.unwrapped._get_observations()["cubeA_pos"]
+        gripper_to_cubeA = env.unwrapped._get_observations()["gripper_to_cubeA"]
+        stack = torch.cat([torch.from_numpy(cubeA_pos),torch.from_numpy(gripper_to_cubeA)])
+        data_list.append(stack) 
+
+    obs_goal = torch.stack(data_list,dim=0).float() # each env data are on the x axis
+    diff = torch.linalg.norm((hl_goal-obs_goal),dim=-1)
+    return diff.mean(), obs_goal
+
+
 def create_storage(): # for episodic data storage
     obs_dim = (hypers.num_envs,hypers.obs_dim)     
     act_dim = (hypers.num_envs,hypers.ll_action_dim)
