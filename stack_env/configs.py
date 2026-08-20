@@ -2,13 +2,14 @@ import torch
 from robosuite import load_composite_controller_config
 from dataclasses import dataclass
 
-@dataclass(frozen=False)
+@dataclass(frozen=True)
 class Hypers:
     ROBOT = "Panda"
     env_name = None
     device = torch.device("cuda:0")
     obs_dim = 162   
-    action_dim = 9     # action space for a single env 
+    ll_action_dim = 9 # low level action dim
+    hl_action_dim = 6 # high level action dim
     batch_size = 1024
     lr = 3e-4
     gamma = .99
@@ -17,7 +18,7 @@ class Hypers:
     max_steps = int(10e6)
     num_envs = 10
     horizon = 500
-    buffer_size = int(1e5)
+    buffer_size = 400
 
 hypers = Hypers()
     
