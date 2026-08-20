@@ -6,7 +6,18 @@ from configs import hypers
 __all__ = ["create_storage", "create_buffer"]
 
 
-def get_local_reward(env,hl_goal): # TODO : review math
+def vec_env(): # environment creation 
+    def make_env():
+        x = robosuite.make(env_name="Stack", **env_configs) 
+        x = GymWrapper(x,list(x.observation_spec()))
+        x.metadata = {"render_mode":[]}
+        x = Autoreset(x)
+        return x 
+    env = SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
+    return env
+
+
+def get_local_reward(env,hl_goal): # TODO : review math and optimize this slow code 
     mujoco_layer = env.unwrapped
     data_list = []
     for env in mujoco_layer.envs:
@@ -17,7 +28,7 @@ def get_local_reward(env,hl_goal): # TODO : review math
 
     obs_goal = torch.stack(data_list,dim=0).float() # each env data are on the x axis
     diff = torch.linalg.norm((hl_goal-obs_goal),dim=-1)
-    return diff.mean(), obs_goal
+    return -diff.mean(), obs_goal
 
 
 def create_storage(): # for episodic data storage
@@ -53,42 +64,58 @@ def create_buffer(): # circular buffer
     ) 
 
 
-def step_envs(queue,policy,goal): # episode collection method  
+def step_envs(queue,hlp,llp): # episode collection method  
     with torch.no_grad():
         env = vec_env()
-        stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()     
+        (
+            stor_curr_states,
+            stor_nx_states,
+            stor_rewards,
+            stor_local_rewards,
+            stor_dones,
+            stor_actions,
+            stor_hl_goals,
+            stor_obs_goals,
+        ) = create_storage()
+
         pointer = 0
         global_step = 0
         obs = torch.from_numpy(env.reset()[0])
 
         while True:
-            if global_step < hypers.warmup: 
-                action = env.action_space.sample()
-            else:
-                action,_,_ = policy(torch.as_tensor(obs)) # TODO pass the goal too 
-                action = action.squeeze()
-            
-            nx_state,reward,done,trunc,info = env.step(action.tolist())
-            # TODO extract the achived goal and replace reward to be goal specific
-            
-            saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
-            
-            stor_curr_states[pointer].copy_(torch.as_tensor(obs))
-            stor_nx_states[pointer].copy_(torch.as_tensor(nx_state))
-            stor_rewards[pointer].copy_(torch.from_numpy(reward))
-            stor_terminated[pointer].copy_(torch.from_numpy(done))
-            stor_actions[pointer].copy_(saved_action)
+            hl_goal,_,_ = self.hlp(state) # sample goal 
 
-            obs = nx_state
-            pointer+=1
-            global_step += 1
+            for n in range(hypers.horizon):
+                if global_step < hypers.warmup: 
+                    action = env.action_space.sample()
+                else:
+                    action,_,_ = policy(torch.as_tensor(obs)) 
+                    action = action.squeeze()
+                
+                nx_state,env_reward,done,trunc,info = env.step(action.tolist())
+                local_reward,obs_goal = get_local_reward(env, hl_goal.cpu())
+                
+                saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
+                
+                stor_curr_states[pointer].copy_(torch.as_tensor(state))
+                stor_nx_states[pointer].copy_(torch.as_tensor(nx_state))
+                stor_rewards[pointer].copy_(torch.from_numpy(env_reward))
+                stor_local_reward[pointer].copy_(local_reward)
+                stor_terminated[pointer].copy_(torch.from_numpy(done))
+                stor_actions[pointer].copy_(saved_action)
+                stor_hl_goal[pointer].copy_(hl_goal)
+                stor_obs_goal[pointer].copy_(obs_goal)
 
-            if pointer == hypers.horizon:
-                data = (stor_curr_states.clone(),stor_nx_states.clone(),stor_rewards.clone(),stor_terminated.clone(),stor_actions.clone())
-                queue.put(data)
-                pointer = 0 
-                stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
-        
+                obs = nx_state
+                pointer+=1
+                global_step += 1
+
+                if pointer == hypers.horizon:
+                    data = (stor_curr_states.clone(),stor_nx_states.clone(),stor_rewards.clone(),stor_terminated.clone(),stor_actions.clone())
+                    queue.put(data)
+                    pointer = 0 
+                    stor_curr_states,stor_nx_states,stor_rewards,stor_terminated,stor_actions = create_storage()
+            
         env.close()
 
 
