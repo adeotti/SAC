@@ -24,7 +24,8 @@ class Hypers:
     horizon = 500
     buffer_size = 400  # 400*horizon = 200k steps
     num_rollout_workers = 5
-    queue_maxsize = 10 # max size of every queue 
+    queue_maxsize = 10 # max size of every queue
+    buffer_min_capacity = 20 # min buffer capacity before starting sampling
 
 hypers = Hypers()
 
