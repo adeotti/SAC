@@ -23,6 +23,8 @@ class Hypers:
     num_envs = 10
     horizon = 500
     buffer_size = 400  # 400*horizon = 200k steps
+    num_rollout_workers = 5
+    queue_maxsize = 10 # max size of every queue 
 
 hypers = Hypers()
 
