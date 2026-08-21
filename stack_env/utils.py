@@ -9,7 +9,7 @@ import numpy as np
 from configs import *
 from tqdm import tqdm
 
-__all__ = ["step_envs", "create_buffer", "filler"]
+__all__ = ["step_envs", "create_buffer", "filler", "sampler"]
 
 
 def vec_env(): # environment creation 
