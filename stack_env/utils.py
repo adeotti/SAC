@@ -5,9 +5,11 @@ from gymnasium.wrappers.common import Autoreset
 
 import torch
 import mlflow
+import time
 import numpy as np
 from configs import *
 from tqdm import tqdm
+
 
 __all__ = ["step_envs", "create_buffer", "filler", "sampler"]
 
@@ -144,8 +146,8 @@ def filler(buffer, episodes_queue, mlflow_run_id): # method used by a wroker to 
         mlflow.log_metric("Main/mean reward", mean_return,run_id=mlflow_run_id, step=global_idx) 
         
 
-def sampler(buffer,gpu_stream): # method for sampling from the buffer
-    n_batch,b_state,b_nx_state,b_rewards,b_terminated,b_actions,current_capacity = buffer
+def sampler(buffer,gpu_stream): # method used by a worker to sample from the buffer then put the sample in a queue
+    b_state, b_nx_state, b_rewards, b_local_rewards, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = buffer
  
     while True:
         if current_capacity.item() < 20:
@@ -156,16 +158,16 @@ def sampler(buffer,gpu_stream): # method for sampling from the buffer
         idx_horizons = torch.randint(0,hypers.horizon,(hypers.batch_size,))
         idx_envs = torch.randint(0,hypers.num_envs,(hypers.batch_size,))
 
-        s_states = b_state[idx_chunks,idx_horizons,idx_envs]
-        s_nx_state = b_nx_state[idx_chunks,idx_horizons,idx_envs]
-        s_reward = b_rewards[idx_chunks,idx_horizons,idx_envs].unsqueeze(-1)
-        s_terminated = b_terminated[idx_chunks,idx_horizons,idx_envs].unsqueeze(-1)
-        s_actions = b_actions[idx_chunks,idx_horizons,idx_envs]
+        s_states = b_state[idx_chunks, idx_horizons, idx_envs]
+        s_nx_state = b_nx_state[idx_chunks, idx_horizons, idx_envs]
+        s_reward = b_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)
+        s_local_rewards = b_local_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)
+        s_dones = b_dones[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)
+        s_actions = b_actions[idx_chunks, idx_horizons, idx_envs]
+        s_hl_goals = b_hl_goals[idx_chunks, idx_horizons, idx_envs]
+        s_obs_goals = b_obs_goals[idx_chunks, idx_horizons, idx_envs]
         
-        try:
-            gpu_stream.put((s_states,s_nx_state,s_reward,s_terminated,s_actions),timeout=1.0)
-        except queue.Full:
-            continue
+        gpu_stream.put((s_states,s_nx_state,s_reward,s_terminated,s_actions), block=True)
 
 
 def print_queue_loading(queue): # tracking queue size mainly during warmup phase
