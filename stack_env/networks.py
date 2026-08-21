@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn 
 import torch.nn.functional as F
 from torch.distributions import Normal
-import numpy as np
 
-__all__ = ["HL","HL_Critic","LL","LL_Critic"]
+__all__ = ["HLP", "HL_Critic", "LLP", "LL_Critic"]
 
 # observation dim = 162, action dim = 9 and goal dim = 6
 
@@ -14,7 +13,7 @@ def weight_init(l):
         nn.init.constant_(l.bias,0.0)
 
 
-class HL(nn.Module):
+class HLP(nn.Module):
     def __init__(self): # high level policy
         super().__init__()
         # target is cat[gripper_to_cubeA,cubeA_pos], shape 6 
@@ -36,7 +35,7 @@ class HL(nn.Module):
         pre_tanh = dist.rsample()
         action = F.tanh(pre_tanh)
         log = dist.log_prob(pre_tanh)
-        log -=  2 * (np.log(2) - pre_tanh - F.softplus(-2 * pre_tanh))  
+        log -=  2 * (torch.log(torch.tensor([2.0])) - pre_tanh - F.softplus(-2 * pre_tanh))  
         log = log.sum(dim=-1,keepdim=True)  
         return action,log,torch.tanh(mean)
 
@@ -58,7 +57,7 @@ class HL_Critic(nn.Module): # high level critic
         return self.output(x)
 
 
-class LL(nn.Module): # low level policy
+class LLP(nn.Module): # low level policy
     def __init__(self):
         super().__init__()
         self.l1 = nn.Linear(162+6,256) # -> obs + goal -> 256
@@ -81,7 +80,7 @@ class LL(nn.Module): # low level policy
         pre_tanh = dist.rsample()
         action = F.tanh(pre_tanh)
         log = dist.log_prob(pre_tanh)
-        log -=  2 * (np.log(2) - pre_tanh - F.softplus(-2 * pre_tanh)) # torch.log(1-action.pow(2) + 1e-6) 
+        log -=  2 * (torch.log(torch.tensor([2.0])) - pre_tanh - F.softplus(-2 * pre_tanh)) 
         log = log.sum(dim=-1,keepdim=True)  
         return action,log,torch.tanh(mean)
     
