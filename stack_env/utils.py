@@ -11,7 +11,7 @@ from configs import *
 from tqdm import tqdm
 
 
-__all__ = ["step_envs", "create_buffer", "filler", "sampler"]
+__all__ = ["step_envs", "create_buffer", "filler", "sampler", "print_queue_loading"]
 
 
 def vec_env(): # environment creation 
@@ -150,7 +150,7 @@ def sampler(buffer,gpu_stream): # method used by a worker to sample from the buf
     b_state, b_nx_state, b_rewards, b_local_rewards, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = buffer
  
     while True:
-        if current_capacity.item() < 20:
+        if current_capacity.item() < hypers.buffer_min_capacity:
             time.sleep(0.1)
             continue
         
@@ -167,16 +167,16 @@ def sampler(buffer,gpu_stream): # method used by a worker to sample from the buf
         s_hl_goals = b_hl_goals[idx_chunks, idx_horizons, idx_envs]
         s_obs_goals = b_obs_goals[idx_chunks, idx_horizons, idx_envs]
         
-        gpu_stream.put((s_states,s_nx_state,s_reward,s_terminated,s_actions), block=True)
+        gpu_stream.put((s_states, s_nx_state, s_reward, s_local_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals), block=True)
 
 
-def print_queue_loading(queue): # tracking queue size mainly during warmup phase
-    pbar = tqdm(total=queue._maxsize,desc="Warmup")
+def print_queue_loading(queue, name, break_point): # tracking queue size 
+    pbar = tqdm(total=queue._maxsize, desc=name)
     while True:
         pbar.n = queue.qsize()
         pbar.refresh()
         time.sleep(0.1)
-        if queue.qsize() == queue._maxsize:
+        if queue.qsize() == break_point:
             break
     pbar.n = queue.qsize()
     pbar.refresh()
