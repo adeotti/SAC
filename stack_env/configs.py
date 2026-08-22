@@ -26,6 +26,7 @@ class Hypers:
     num_rollout_workers = 5
     queue_maxsize = 10 # max size of every queue
     buffer_min_capacity = 20 # min buffer capacity before starting sampling
+    high_level_train_steps = 10 # number of update on the policy, critics, targets and alpha during high level training 
 
 hypers = Hypers()
 
