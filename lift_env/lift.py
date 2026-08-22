@@ -318,9 +318,9 @@ class main:
                 ep_queue = mp.Queue(maxsize=10) 
                 process__ = []
                 for n in range(5):
-                    step_thread = mp.Process(target=step,args=(ep_queue,actor_cpu,),daemon=True)
+                    step_process = mp.Process(target=step,args=(ep_queue,actor_cpu,),daemon=True)
                     process__.append(step_thread)
-                    step_thread.start()
+                    step_process.start() 
 
                 print_queue_loading(ep_queue)
                 
@@ -351,11 +351,10 @@ class main:
                     terminated = terminated.to(hypers.device,dtype=torch.float)
                     actions = actions.to(hypers.device,dtype=torch.float)
 
-                    with torch.no_grad():
+                    with torch.no_grad(): # Q target
                         nx_actions,log_nx_actions,_ = self.actor(nx_states)
                         min_q_target = torch.min(self.q1_target(nx_states,nx_actions),self.q2_target(nx_states,nx_actions))
                         q_target = reward + hypers.gamma * (1-terminated) * (min_q_target - alpha.detach() * log_nx_actions)
-                        # R(st|at) + gamma * (Q(st,at) - alpha * log pi(at|st))
 
                     q1_pred = self.q1(states,actions) 
                     q1_loss = F.smooth_l1_loss(q1_pred,q_target)
@@ -370,17 +369,18 @@ class main:
                     q2_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.q2.parameters(),1.0)
                     self.q2_optim.step() # critic 2 
-             
+                    
+                    # polyak averaging
                     for q1_pars,q1_target_pars in zip(self.q1.parameters(),self.q1_target.parameters()):
                         q1_target_pars.data.mul_(1.0 - hypers.tau).add_(q1_pars.data,alpha=hypers.tau)
                 
                     for q2_pars,q2_target_pars in zip(self.q2.parameters(),self.q2_target.parameters()):
                         q2_target_pars.data.mul_(1.0 - hypers.tau).add_(q2_pars.data,alpha=hypers.tau)
                     
+                    # policy loss
                     new_action,log_pi,_ = self.actor(states)
                     min_q = torch.min(self.q1(states,new_action),self.q2(states,new_action))
-                    policy_loss = ((alpha.detach() * log_pi) -  min_q).mean() # alpla * log policy(at|st) - Q(st,at)
-                    
+                    policy_loss = ((alpha.detach() * log_pi) -  min_q).mean() 
                     self.actor.optim.zero_grad(set_to_none=True)
                     policy_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(),1.0)
