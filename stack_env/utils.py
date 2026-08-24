@@ -11,32 +11,49 @@ from configs import *
 from tqdm import tqdm
 
 
-__all__ = ["step_envs", "create_buffer", "filler", "sampler", "print_queue_loading"]
+__all__ = [
+    "step_envs",
+    "create_buffer",
+    "generate_random_samples",
+    "filler", 
+    "low_level_sampler",
+    "high_level_sampler",
+    "print_queue_loading"
+]
+
+
+CUBEA_SLICE = slice(0, 3)  # "cubeA_pos"
+GRIPPER_TO_CUBEA_SLICE = slice(17, 20)  # "gripper_to_cubeA"
 
 
 def vec_env(): # environment creation 
     def make_env():
         x = robosuite.make(env_name="Stack", **env_configs) 
-        x = GymWrapper(x,list(x.observation_spec()))
+        x = GymWrapper(x, sorted(list(x.active_observables)))
         x.metadata = {"render_mode":[]}
         x = Autoreset(x)
         return x 
-    env = SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
-    return env
+    return SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
 
 
-def get_local_reward(env,hl_goal): # TODO : review math and optimize this slow code 
-    mujoco_layer = env.unwrapped
-    data_list = []
-    for env in mujoco_layer.envs:
-        cubeA_pos = env.unwrapped._get_observations()["cubeA_pos"]
-        gripper_to_cubeA = env.unwrapped._get_observations()["gripper_to_cubeA"]
-        stack = torch.cat([torch.from_numpy(cubeA_pos),torch.from_numpy(gripper_to_cubeA)])
-        data_list.append(stack) 
+def get_local_reward(state, next_state, hl_goal):
+    curr_goal = torch.cat([state[:, CUBEA_SLICE], state[:, GRIPPER_TO_CUBEA_SLICE]], dim=-1)
+    observed_goal = torch.cat([next_state[:, CUBEA_SLICE], next_state[:, GRIPPER_TO_CUBEA_SLICE]], dim=-1)
+    target = curr_goal + hl_goal
+    reward = torch.linalg.norm((target-observed_goal), dim=-1, keepdim=True)
+    return reward.squeeze(), observed_goal
 
-    obs_goal = torch.stack(data_list,dim=0).float() # each env data are on the x axis
-    diff = torch.linalg.norm((hl_goal-obs_goal),dim=-1)
-    return -diff.mean(), obs_goal
+
+def generate_random_samples(N=32): # random samples for testing 
+    s_states = torch.randn((N, hypers.obs_dim), dtype=torch.half)
+    s_nx_state = torch.randn((N, hypers.obs_dim), dtype=torch.half)
+    s_reward = torch.randn((N, 1), dtype=torch.half)
+    s_local_rewards = torch.randn((N, 1), dtype=torch.half)
+    s_dones = torch.randint(0, 2, (N, 1), dtype=torch.bool)
+    s_actions = torch.randn((N, hypers.ll_action_dim), dtype=torch.half)
+    s_hl_goals = torch.randn((N, hypers.hl_action_dim), dtype=torch.half)
+    s_obs_goals = torch.randn((N, hypers.hl_action_dim), dtype=torch.half)
+    return s_states, s_nx_state, s_reward, s_local_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals
 
 
 def create_storage(): # for episodic data storage
@@ -92,8 +109,10 @@ def step_envs(queue, hlp, llp): # episode collection method
                     action = action.squeeze()
                 
                 nx_state,env_reward,done,trunc,info = env.step(action.tolist())
-                local_reward,obs_goal = get_local_reward(env, goal) # TODO review formulas and h function
-                        
+                local_reward,obs_goal = get_local_reward(
+                        torch.as_tensor(obs), torch.as_tensor(nx_state), goal
+                ) 
+                      
                 stor_curr_states[n].copy_(torch.as_tensor(obs))
                 stor_nx_states[n].copy_(torch.as_tensor(nx_state))
                 stor_rewards[n].copy_(torch.from_numpy(env_reward))
@@ -108,15 +127,9 @@ def step_envs(queue, hlp, llp): # episode collection method
 
                 if n > 0 and n % hypers.horizon-1 == 0:
                     data = (
-                        stor_curr_states.clone(),
-                        stor_nx_states.clone(),
-                        stor_rewards.clone(),
-                        stor_local_rewards.clone(),
-                        stor_dones.clone(),
-                        stor_actions.clone(),
-                        stor_hl_goals.clone(),
-                        stor_obs_goals.clone()
+                        stor_curr_states, stor_nx_states, stor_rewards, stor_local_rewards, stor_dones, stor_actions, stor_hl_goals, stor_obs_goals
                     )
+                    data = [tensor.clone() for tensor in data]
                     queue.put(data)
                  
 
@@ -146,7 +159,7 @@ def filler(buffer, episodes_queue, mlflow_run_id): # method used by a wroker to 
         mlflow.log_metric("Main/mean reward", mean_return,run_id=mlflow_run_id, step=global_idx) 
         
 
-def sampler(buffer,gpu_stream): # method used by a worker to sample from the buffer then put the sample in a queue
+def low_level_sampler(buffer,low_gpu_stream): # method used by a worker to sample from the buffer then put the sample in a queue
     b_state, b_nx_state, b_rewards, b_local_rewards, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = buffer
  
     while True:
@@ -158,16 +171,51 @@ def sampler(buffer,gpu_stream): # method used by a worker to sample from the buf
         idx_horizons = torch.randint(0,hypers.horizon,(hypers.batch_size,))
         idx_envs = torch.randint(0,hypers.num_envs,(hypers.batch_size,))
 
-        s_states = b_state[idx_chunks, idx_horizons, idx_envs]
-        s_nx_state = b_nx_state[idx_chunks, idx_horizons, idx_envs]
-        s_reward = b_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)
-        s_local_rewards = b_local_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)
-        s_dones = b_dones[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)
-        s_actions = b_actions[idx_chunks, idx_horizons, idx_envs]
-        s_hl_goals = b_hl_goals[idx_chunks, idx_horizons, idx_envs]
-        s_obs_goals = b_obs_goals[idx_chunks, idx_horizons, idx_envs]
+        s_states = b_state[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 162]) 
+        s_nx_state = b_nx_state[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 162]) 
+        s_reward = b_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # torch.Size([1024, 1]) 
+        s_local_rewards = b_local_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # torch.Size([1024, 1]) 
+        s_dones = b_dones[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # torch.Size([1024, 1])
+        s_actions = b_actions[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 9]) 
+        s_hl_goals = b_hl_goals[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 6]) 
+        s_obs_goals = b_obs_goals[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 6])
+
+        data = (s_states, s_nx_state, s_reward, s_local_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals)
+        low_gpu_stream.put(data, block=True)
+
+
+def high_level_sampler(buffer,high_gpu_stream):
+    b_state, b_nx_state, b_rewards, b_local_rewards, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = buffer
+    
+    while True:
+        if current_capacity.item() < hypers.buffer_min_capacity:
+            time.sleep(0.1)
+            continue
+
+        idx_chunks = torch.randint(0, current_capacity, (hypers.batch_size,))
+        idx_horizons = torch.randint(0, hypers.horizon, (hypers.batch_size,))
+        idx_envs = torch.randint(0, hypers.num_envs, (hypers.batch_size,))
+
+        max_start_t = hypers.horizon - hypers.high_level_train_steps
+        idx_starts  = torch.randint(0, max_start_t, (hypers.batch_size, 1), device=b_state.device)
+
+        offsets = torch.arange(hypers.high_level_train_steps, device=b_state.device).unsqueeze(0) # [1, c]
+        seq_t   = idx_starts + offsets                                                             # [1024, c]
+        idx_chunks_2d = idx_chunks.unsqueeze(1).expand(-1, hypers.high_level_train_steps)
+        idx_envs_2d   = idx_envs.unsqueeze(1).expand(-1, hypers.high_level_train_steps)
+
+        s_states   = b_state[idx_chunks_2d, seq_t, idx_envs_2d]     # [1024, 10, state_dim]
+        s_actions  = b_actions[idx_chunks_2d, seq_t, idx_envs_2d]    # [1024, 10, action_dim]
+        s_hl_goals = b_hl_goals[idx_chunks_2d, seq_t, idx_envs_2d]   # [1024, 10, goal_dim] 
+        s_obs_goals = b_obs_goals[idx_chunks_2d, seq_t, idx_envs_2d]
+        #-
+        s_nx_states = b_nx_state[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 162])
+        s_rewards = b_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # torch.Size([1024, 1]) 
+        s_local_rewards = b_local_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # torch.Size([1024, 1]) 
+        s_dones = b_dones[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # torch.Size([1024, 1])
         
-        gpu_stream.put((s_states, s_nx_state, s_reward, s_local_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals), block=True)
+        data = (s_states, s_nx_states, s_rewards, s_local_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals)
+        high_gpu_stream.put(data, block=True)
 
 
 def print_queue_loading(queue, name, break_point): # tracking queue size 
