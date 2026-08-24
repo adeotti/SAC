@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn 
 import torch.nn.functional as F
 from torch.distributions import Normal
+import numpy as np
+from configs import hypers
 
 __all__ = ["HLP", "HL_Critic", "LLP", "LL_Critic"]
 
-# observation dim = 162, action dim = 9 and goal dim = 6
+# observation dim = 81, action dim = 9 and goal dim = 6
 
 def weight_init(l):
     if isinstance(l,nn.Linear):
@@ -14,16 +16,14 @@ def weight_init(l):
 
 
 class HLP(nn.Module):
-    def __init__(self): # high level policy
+    def __init__(self): # high level policy, target is cat[gripper_to_cubeA,cubeA_pos], shape 6 
         super().__init__()
-        # target is cat[gripper_to_cubeA,cubeA_pos], shape 6 
-        # to get the upper bound of the two values : gripper_to_cubeA.max() and cubeA_pos.max()  
-        self.l1 = nn.Linear(162,256)
-        self.lmean = nn.Linear(256,6)
-        self.lstd = nn.Linear(256,6)
+        self.l1 = nn.Linear(hypers.obs_dim, 256)
+        self.lmean = nn.Linear(256, 6)
+        self.lstd = nn.Linear(256, 6)
         self.apply(weight_init)
 
-    def forward(self,obs):
+    def forward(self, obs):
         x = F.silu(self.l1(obs))
 
         mean = self.lmean(x)
@@ -35,22 +35,22 @@ class HLP(nn.Module):
         pre_tanh = dist.rsample()
         action = F.tanh(pre_tanh)
         log = dist.log_prob(pre_tanh)
-        log -=  2 * (torch.log(torch.tensor([2.0])) - pre_tanh - F.softplus(-2 * pre_tanh))  
+        log -=  2 * (np.log(2) - pre_tanh - F.softplus(-2 * pre_tanh))  
         log = log.sum(dim=-1,keepdim=True)  
-        return action,log,torch.tanh(mean)
+        return action, log, torch.tanh(mean)
 
 
 class HL_Critic(nn.Module): # high level critic 
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(162+6,256)
-        self.l2 = nn.Linear(256,256)
-        self.l3 = nn.Linear(256,256)
-        self.output = nn.Linear(256,1)
+        self.l1 = nn.Linear(hypers.obs_dim + hypers.hl_action_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, 256)
+        self.output = nn.Linear(256, 1)
         self.apply(weight_init) 
 
     def forward(self,obs,goal): 
-        cat = torch.cat((obs,goal),dim=-1)
+        cat = torch.cat((obs,goal), dim=-1)
         x = F.silu(self.l1(cat))
         x = F.silu(self.l2(x))
         x = F.silu(self.l3(x))
@@ -60,14 +60,14 @@ class HL_Critic(nn.Module): # high level critic
 class LLP(nn.Module): # low level policy
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(162+6,256) # -> obs + goal -> 256
-        self.l2 = nn.Linear(256,256)
-        self.l_mean = nn.Linear(256,9)
-        self.l_std = nn.Linear(256,9)
+        self.l1 = nn.Linear(hypers.obs_dim + hypers.hl_action_dim, 256) # -> obs + goal -> 256
+        self.l2 = nn.Linear(256, 256)
+        self.l_mean = nn.Linear(256, hypers.ll_action_dim)
+        self.l_std = nn.Linear(256, hypers.ll_action_dim)
         self.apply(weight_init)
         
     def forward(self,obs,goal):
-        x = torch.cat([obs,goal],dim=-1)
+        x = torch.cat([obs,goal], dim=-1)
         x = F.silu(self.l1(x))
         x = F.silu(self.l2(x))
         
@@ -80,22 +80,22 @@ class LLP(nn.Module): # low level policy
         pre_tanh = dist.rsample()
         action = F.tanh(pre_tanh)
         log = dist.log_prob(pre_tanh)
-        log -=  2 * (torch.log(torch.tensor([2.0])) - pre_tanh - F.softplus(-2 * pre_tanh)) 
-        log = log.sum(dim=-1,keepdim=True)  
-        return action,log,torch.tanh(mean)
+        log -=  2 * (np.log(2) - pre_tanh - F.softplus(-2 * pre_tanh)) 
+        log = log.sum(dim=-1, keepdim=True)  
+        return action, log, torch.tanh(mean)
     
 
 class LL_Critic(nn.Module): # low level critic 
     def __init__(self):
         super().__init__()
-        self.l1 = nn.Linear(162+9+6,256) # -> obs + action + goal -> 256
-        self.l2 = nn.Linear(256,256)
-        self.l3 = nn.Linear(256,256)
-        self.output = nn.Linear(256,1)
+        self.l1 = nn.Linear(hypers.obs_dim + hypers.ll_action_dim + hypers.hl_action_dim, 256) # -> obs + action + goal -> 256
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, 256)
+        self.output = nn.Linear(256, 1)
         self.apply(weight_init) 
 
     def forward(self,obs,action,goal): 
-        cat = torch.cat((obs,action,goal),dim=-1)
+        cat = torch.cat((obs,action,goal), dim=-1)
         x = F.silu(self.l1(cat))
         x = F.silu(self.l2(x))
         x = F.silu(self.l3(x))
