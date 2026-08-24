@@ -39,7 +39,7 @@ class main:
         self.qh_optim = Adam(chain(self.qh1.parameters(), self.qh2.parameters()), lr=hypers.critic_lr, fused=True)
         self.ql_optim = Adam(chain(self.ql1.parameters(), self.ql2.parameters()), lr=hypers.critic_lr, fused=True)
 
-        #self.compile_()
+        self.compile_()
         
         self.hl_entropy_target = -hypers.hl_action_dim
         self.hl_log_alpha = torch.tensor(1.0,requires_grad=True, device=hypers.device)  
@@ -49,37 +49,28 @@ class main:
         self.ll_log_alpha = torch.tensor(1.0,requires_grad=True, device=hypers.device)  
         self.ll_alpha_optim = Adam([self.ll_log_alpha], lr=hypers.alpha_lr)
         
-        self.storage_path = storage_path
-        self.n = 0 # tracking number for model data saving 
+        self.storage_path = storage_path 
 
     def compile_(self):
-        self.hlp.compile(mode="max-autotune")
-        self.qh1.compile()
-        self.qh2.compile()
-        self.qh1_target.compile()
-        self.qh2_target.compile()
-        
-        self.llp.compile(mode="max-autotune")
-        self.ql1.compile()
-        self.ql2.compile()
-        self.ql1_target.compile()
-        self.ql2_target.compile()
+        self.hlp.compile() ; self.llp.compile()
+        self.qh1.compile() ; self.ql1.compile() 
+        self.qh2.compile() ; self.ql2.compile()
             
     def save(self, step):
         check = {
             "high level state": self.hlp.state_dict(),
-            "low level state": self.actor.state_dict(),             
+            "low level state": self.llp.state_dict(),             
         }
         torch.save(check,f"{self.storage_path}{step}.pth")
     
     def compute_q_target(self,q1, q2, nx_actions, log_nx_actions, nx_states, obs_goals, reward, terminated, alpha):
         min_q_target = torch.min(q1,q2).squeeze()
         q_target = reward.squeeze() + hypers.gamma * (1-terminated) * (min_q_target-alpha.detach() * log_nx_actions.squeeze()) 
-        return q_target
+        return q_target,min_q_target
     
     def update_critics(self, q1_pred, q2_pred, q_target, optim):
         loss = F.smooth_l1_loss(q1_pred, q_target) + F.smooth_l1_loss(q2_pred, q_target) 
-        optim.zero_grad(set_to_none=True)
+        optim.zero_grad()
         loss.backward()
         optim.step() 
         return loss
@@ -94,20 +85,19 @@ class main:
     def update_policy(self, q1, q2, alpha, log_pi, optim):
         min_q = torch.min(q1,q2)
         loss = ((alpha.detach()*log_pi.squeeze()) -  min_q).mean() 
-        optim.zero_grad(set_to_none=True)
+        optim.zero_grad()
         loss.backward()
         optim.step()
         return loss
     
     def tune_alpha(self, log_alpha, log_pi, entropy_target, optim):
         alpha_loss = (log_alpha * (-log_pi-entropy_target).detach()).mean()
-        optim.zero_grad(set_to_none=True)
+        optim.zero_grad()
         alpha_loss.backward() 
         optim.step()
         alpha = log_alpha.exp()
         return alpha
     
-    #@torch.compile()
     def relabel_goals(self,_hl_goals,_obs_goals,_states,_actions):
         sample_1 = _hl_goals.unsqueeze(2)  # [1024, 10, 6] -> [1024, 10, 1, 6]
         sample_2 = (_hl_goals - _obs_goals).unsqueeze(2)  # [1024, 10, 6]) --> [1024, 10, 1, 6]
@@ -130,7 +120,7 @@ class main:
         return _hl_goals
     
     def train_low_level_policy(self, low_gpu_stream, ll_alpha, llp_cpu, run_id):
-        for c in tqdm(range(hypers.max_llp_update_steps+1), total=hypers.max_llp_update_steps+1, desc="Low Level", position=0, leave=True): 
+        for n in tqdm(range(hypers.max_llp_update_steps+1), total=hypers.max_llp_update_steps+1, desc="Low Level", position=0, leave=True): 
             data = low_gpu_stream.get()
             data = [tensor.to(hypers.device, dtype=torch.float) for tensor in data]
             _states, _nx_states, _, _local_reward, _dones, _actions, _hl_goals, _obs_goals = data
@@ -139,7 +129,9 @@ class main:
                 nx_actions,log_nx_actions,_ = self.llp(_nx_states,_obs_goals)
                 q1 = self.ql1_target(_nx_states,nx_actions,_obs_goals)
                 q2 = self.ql2_target(_nx_states,nx_actions,_obs_goals)
-                q_target = self.compute_q_target(q1, q2, nx_actions, log_nx_actions, _nx_states, _obs_goals, _local_reward, _dones, ll_alpha)
+                q_target, q_min_target = self.compute_q_target(
+                        q1, q2, nx_actions, log_nx_actions, _nx_states, _obs_goals, _local_reward, _dones, ll_alpha
+                )
                                      
             q1_pred = self.ql1(_states,_actions,_hl_goals).squeeze() 
             q2_pred = self.ql2(_states,_actions,_hl_goals).squeeze()
@@ -150,11 +142,24 @@ class main:
             new_action,log_pi,_ = self.llp(_states,_hl_goals)
             q1 = self.ql1(_states,new_action,_hl_goals).squeeze()
             q2 = self.ql2(_states,new_action,_hl_goals).squeeze()
-            # alpla * log policy(at|st,g_t) - min(Q_(1,2)(st,g_t,at)) 
-            ll_policy_loss = self.update_policy(q1, q2, ll_alpha, log_pi, self.llp_optim) 
+            ll_policy_loss = self.update_policy(q1, q2, ll_alpha, log_pi, self.llp_optim) # alpla * log policy(at|st,g_t) - min(Q_(1,2)(st,g_t,at)) 
             llp_cpu.load_state_dict(self.llp.state_dict()) # update low level policy cpu state 
 
-            ll_alpha = self.tune_alpha(self.ll_log_alpha, log_pi, self.ll_entropy_target, self.ll_alpha_optim) 
+            ll_alpha = self.tune_alpha(self.ll_log_alpha, log_pi, self.ll_entropy_target, self.ll_alpha_optim)
+            
+            if n>0 and n%int(1e3) == 0:
+                mlflow.log_metrics(
+                    {   
+                        "Low Level/low level critic min q": q_min_target.mean().item(),
+                        "Low Level/low level critic loss": ll_q_loss.item(),
+                        "Low Level/low level policy loss": ll_policy_loss.item(),
+                        "Low Level/low level alpha": ll_alpha.item(),
+                    },
+                    step = n,
+                    run_id = run_id
+                )
+
+            if n>0 and n%int(20e3) == 0: self.save(n)
 
     def train_high_level_policy(self, high_gpu_stream, hl_alpha, hlp_cpu, run_id):
         for n in tqdm(range(hypers.max_hlp_update_steps+1), total=hypers.max_hlp_update_steps+1, desc="High Level", position=1, leave=True):
@@ -171,7 +176,9 @@ class main:
                 nx_actions,log_nx_actions,_ = self.hlp(_nx_states)
                 q1 = self.qh1_target(_nx_states,_obs_goals)
                 q2 = self.qh2_target(_nx_states,_obs_goals)
-                q_target = self.compute_q_target(q1, q2, nx_actions, log_nx_actions, _nx_states, _obs_goals, _reward, _dones, hl_alpha)
+                q_target, q_min_target = self.compute_q_target(
+                    q1, q2, nx_actions, log_nx_actions, _nx_states, _obs_goals, _reward, _dones, hl_alpha
+                )
      
             q1_pred = self.qh1(_states,_hl_goals).squeeze()
             q2_pred = self.qh2(_states,_hl_goals).squeeze()
@@ -182,11 +189,22 @@ class main:
             new_action,log_pi,_ = self.hlp(_states)
             q1 = self.qh1(_states,new_action).squeeze()
             q2 = self.qh2(_states,new_action).squeeze()
-            # alpla * log policy(at|st) - min(Q_(1,2)(st,g_t)) 
-            hl_policy_loss = self.update_policy(q1, q2, hl_alpha, log_pi, self.hlp_optim)
+            hl_policy_loss = self.update_policy(q1, q2, hl_alpha, log_pi, self.hlp_optim)  # alpla * log policy(at|st) - min(Q_(1,2)(st,g_t)) 
             hlp_cpu.load_state_dict(self.hlp.state_dict()) # update high level policy cpu state
 
             hl_alpha = self.tune_alpha(self.hl_log_alpha, log_pi, self.hl_entropy_target, self.hl_alpha_optim)
+            
+            if n>0 and n%int(1e3) == 0:
+                mlflow.log_metrics(
+                    {   
+                        "High Level/high level critic min q": q_min_target.mean().item(),
+                        "High Level/high level critic loss": hl_q_loss.item(),
+                        "High Level/high level policy loss": hl_policy_loss.item(),
+                        "High Level/high level alpha": hl_alpha.item(),
+                    },
+                    step = n,
+                    run_id = run_id
+                ) 
 
     def train(self):
         mlflow.set_experiment("sac-stack-robosuite")
@@ -234,8 +252,7 @@ class main:
                 high_worker.join()
             
             finally:
-                for process in processes_list: process.terminate()
-                
+                for process in processes_list: process.terminate() 
                 filler_worker.terminate()
                 low_sampler_worker.terminate()
                 high_sampler_worker.terminate()
