@@ -36,11 +36,19 @@ def vec_env(): # environment creation
     return SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
 
 
-def get_local_reward(state, next_state, hl_goal):
-    curr_goal = torch.cat([state[:, CUBEA_SLICE], state[:, GRIPPER_TO_CUBEA_SLICE]], dim=-1)
-    observed_goal = torch.cat([next_state[:, CUBEA_SLICE], next_state[:, GRIPPER_TO_CUBEA_SLICE]], dim=-1)
-    target = curr_goal + hl_goal
-    reward = torch.linalg.norm((target-observed_goal), dim=-1, keepdim=True)
+def get_local_reward(state, next_state, hl_goal, max_dist=1.41):
+    cube_pos_hl_goal = hl_goal[:, :3]
+    target_cubea = state[:, CUBEA_SLICE] + cube_pos_hl_goal
+    nx_cubea = next_state[:, CUBEA_SLICE]
+    cube_l = torch.linalg.norm((target_cubea - nx_cubea), dim=-1, keepdim=True)
+    
+    gripper_hl_goal = hl_goal[:, 3:]
+    target_gripper = state[:, GRIPPER_TO_CUBEA_SLICE] + gripper_hl_goal
+    nx_gripper = next_state[:, GRIPPER_TO_CUBEA_SLICE]
+    gripper_l = torch.linalg.norm((target_gripper - nx_gripper), dim=-1, keepdim=True)
+    
+    reward = -(cube_l+gripper_l)
+    observed_goal = torch.cat([nx_cubea, nx_gripper], dim=-1) 
     return reward.squeeze(), observed_goal
 
 
@@ -99,19 +107,19 @@ def step_envs(queue, hlp, llp): # episode collection method
         obs = torch.from_numpy(env.reset()[0])
 
         while True:
-            goal,_,_ = hlp(torch.as_tensor(obs)) # sample goal with high level policy 
+            goal = hlp(torch.as_tensor(obs))[0] # sample goal with high level policy
 
             for n in range(hypers.horizon):
                 if global_step < hypers.warmup: 
                     action = env.action_space.sample()
                 else:
-                    action,_,_ = llp(torch.as_tensor(obs),goal) 
+                    action = llp(torch.as_tensor(obs),goal)[0] 
                     action = action.squeeze()
                 
                 nx_state,env_reward,done,trunc,info = env.step(action.tolist())
                 local_reward,obs_goal = get_local_reward(
                         torch.as_tensor(obs), torch.as_tensor(nx_state), goal
-                ) 
+                )
                       
                 stor_curr_states[n].copy_(torch.as_tensor(obs))
                 stor_nx_states[n].copy_(torch.as_tensor(nx_state))
@@ -181,6 +189,7 @@ def low_level_sampler(buffer,low_gpu_stream): # method used by a worker to sampl
         s_obs_goals = b_obs_goals[idx_chunks, idx_horizons, idx_envs]  # torch.Size([1024, 6])
 
         data = (s_states, s_nx_state, s_reward, s_local_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals)
+        data = [tensor.detach() for tensor in data]
         low_gpu_stream.put(data, block=True)
 
 
