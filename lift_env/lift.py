@@ -59,6 +59,8 @@ def vec_env():
     def make_env():
         x = suite.make(env_name = "Lift",**env_configs) # Lift
         x = GymWrapper(x,list(x.observation_spec()))
+        # observation_spec() create duplicate data point in the returned state observation,
+        # switch to x.active_observables and set hypers.obs_dim to 68 to avoid wasting compute by training on duplicated data point
         x.metadata = {"render_mode":[]}
         x = Autoreset(x)
         return x
