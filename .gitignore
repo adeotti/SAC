@@ -3,6 +3,7 @@ gym_env/pickplace.ipynb
 gym_env/pick_place.py
 gym_env/
 stack_env/goals.py
+stack_env/_stack.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
