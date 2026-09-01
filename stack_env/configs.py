@@ -9,7 +9,7 @@ class Hypers:
     ROBOT = "Panda"
     env_name = None
     device = torch.device("cuda:0")
-    obs_dim = 162   
+    obs_dim = 81   
     ll_action_dim = 9  # low level action dim
     hl_action_dim = 6  # high level action dim
     batch_size = 1024
@@ -19,12 +19,14 @@ class Hypers:
     gamma = .99
     tau = .005
     warmup = 2000
-    max_steps = int(10e6)
+    max_hlp_update_steps = int(10e5) 
+    max_llp_update_steps = int(10e6)
     num_envs = 10
     horizon = 500
     buffer_size = 400  # 400*horizon = 200k steps
-    num_rollout_workers = 5
-    queue_maxsize = 10 # max size of every queue
+    num_rollout_workers = 6
+    low_queue_maxsize = 10 # max size of every queue
+    high_queue_maxsize = 20
     buffer_min_capacity = 20 # min buffer capacity before starting sampling
     high_level_train_steps = 10 # number of update on the policy, critics, targets and alpha during high level training 
 
