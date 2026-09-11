@@ -18,20 +18,18 @@ class Hypers:
     alpha_lr = 3e-4
     gamma = .99
     tau = .005
-    warmup = 2000
-    max_hlp_update_steps = int(10e5) 
+    max_hlp_update_steps = int(10e6) 
     max_llp_update_steps = int(10e6)
     num_envs = 10
     horizon = 500
     buffer_size = 400  # 400*horizon = 200k steps
-    num_rollout_workers = 6
-    low_queue_maxsize = 10 # max size of every queue
-    high_queue_maxsize = 20
-    buffer_min_capacity = 20 # min buffer capacity before starting sampling
-    high_level_train_steps = 10 # number of update on the policy, critics, targets and alpha during high level training 
+    num_rollout_workers = 10
+    warmup = 20_000 // (num_rollout_workers*num_envs)
+    low_queue_maxsize = 10 
+    high_queue_maxsize = 10
+    buffer_min_capacity = 80 # min buffer capacity before starting sampling
 
 hypers = Hypers()
-
 
 cont_config = controller = load_composite_controller_config(robot=hypers.ROBOT)
 env_configs = {
@@ -45,4 +43,4 @@ env_configs = {
     "horizon": hypers.horizon,  # Max steps before reset or trunc = True
     "control_freq": 20,
     "reward_scale": 1.0
-    }
+}
