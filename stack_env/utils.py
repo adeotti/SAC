@@ -201,16 +201,15 @@ def high_level_sampler(buffer,high_gpu_stream):
         s_rewards = b_rewards[batch_idx, horizon_idx, env_idx]     # [1024, 10, 1] 
         s_dones = b_dones[batch_idx, horizon_idx, env_idx]         # [1024, 10, 1]
         s_actions  = b_actions[batch_idx, horizon_idx, env_idx]    # [1024, 10, 9]
-        s_hl_goals = b_hl_goals[batch_idx, horizon_idx, env_idx]   # [1024, 10, 6]
+        s_hl_goals = b_hl_goals[batch_idx, horizon_idx, env_idx].float()   # [1024, 10, 6]
         s_obs_goals = b_obs_goals[batch_idx, horizon_idx, env_idx] # [1024, 10, 6]
         #-
-        s_nx_states = s_nx_states[:, -1, :]      # [1024, 81]
-        s_rewards = (s_rewards * gammas).sum(dim=1)  # [1024, 1] discounting and summing reward on dim 1 
-        s_dones = s_dones[:, -1, :]              # [1024, 1]
+        s_nx_states = s_nx_states[:, -1, :]                               # [1024, 81]
+        s_rewards = (s_rewards * gammas).sum(dim=1)                       # [1024, 1] discounting and summing reward on dim 1 
+        s_dones = s_dones[:, -1, :]  ;  assert not s_dones[:, :-1].any()  # [1024, 1]
         s_hl_goals = s_hl_goals[:, 0, :]         # [1024, 6]
         s_obs_goals = s_obs_goals[:, -1, :]      # [1024, 6]
         
         data = (s_states, s_nx_states, s_rewards, s_dones, s_actions, s_hl_goals, s_obs_goals)
 
-        high_gpu_stream.put(data, block=True)
-        
+        high_gpu_stream.put(data, block=True) 
