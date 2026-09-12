@@ -13,8 +13,8 @@ class Hypers:
     ll_action_dim = 9  # low level action dim
     hl_action_dim = 6  # high level action dim
     batch_size = 1024
-    policy_lr = .0001 
-    critic_lr = .001
+    policy_lr = 3e-4 #.0001 
+    critic_lr = 3e-4 #.001
     alpha_lr = 3e-4
     gamma = .99
     tau = .005
@@ -22,12 +22,12 @@ class Hypers:
     max_llp_update_steps = int(10e6)
     num_envs = 10
     horizon = 500
-    buffer_size = 400  # 400*horizon = 200k steps
+    buffer_size = 200  # 200*horizon = 100k steps
     num_rollout_workers = 10
     warmup = 20_000 // (num_rollout_workers*num_envs)
     low_queue_maxsize = 10 
     high_queue_maxsize = 10
-    buffer_min_capacity = 80 # min buffer capacity before starting sampling
+    buffer_min_capacity = 20 # min buffer capacity before starting sampling
 
 hypers = Hypers()
 
