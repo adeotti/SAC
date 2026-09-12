@@ -171,7 +171,7 @@ def low_level_sampler(buffer,low_gpu_stream): # method used by a worker to sampl
         s_nx_state = b_nx_state[idx_chunks, idx_horizons, idx_envs]                          # [1024, 81]
         s_reward = b_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)               # [1024, 1]
         s_local_rewards = b_local_rewards[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # [1024, 1]
-        s_dones = b_dones[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1)  # [1024, 1]
+        s_dones = b_dones[idx_chunks, idx_horizons, idx_envs].unsqueeze(-1).float()          # [1024, 1]
         s_actions = b_actions[idx_chunks, idx_horizons, idx_envs]            # [1024, 9]
         s_hl_goals = b_hl_goals[idx_chunks, idx_horizons, idx_envs]          # [1024, 6]
         s_obs_goals = b_obs_goals[idx_chunks, idx_horizons, idx_envs]        # [1024, 6]
@@ -201,12 +201,12 @@ def high_level_sampler(buffer,high_gpu_stream):
         s_rewards = b_rewards[batch_idx, horizon_idx, env_idx]     # [1024, 10, 1] 
         s_dones = b_dones[batch_idx, horizon_idx, env_idx]         # [1024, 10, 1]
         s_actions  = b_actions[batch_idx, horizon_idx, env_idx]    # [1024, 10, 9]
-        s_hl_goals = b_hl_goals[batch_idx, horizon_idx, env_idx].float()   # [1024, 10, 6]
+        s_hl_goals = b_hl_goals[batch_idx, horizon_idx, env_idx]   # [1024, 10, 6]
         s_obs_goals = b_obs_goals[batch_idx, horizon_idx, env_idx] # [1024, 10, 6]
         #-
         s_nx_states = s_nx_states[:, -1, :]                               # [1024, 81]
         s_rewards = (s_rewards * gammas).sum(dim=1)                       # [1024, 1] discounting and summing reward on dim 1 
-        s_dones = s_dones[:, -1, :]  ;  assert not s_dones[:, :-1].any()  # [1024, 1]
+        s_dones = s_dones[:, -1, :].float()  ;  assert not s_dones[:, :-1].any()  # [1024, 1]
         s_hl_goals = s_hl_goals[:, 0, :]         # [1024, 6]
         s_obs_goals = s_obs_goals[:, -1, :]      # [1024, 6]
         
