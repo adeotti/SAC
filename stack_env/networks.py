@@ -89,9 +89,9 @@ class LLP(nn.Module): # low level policy
         mean_action = torch.tanh(dist.mean)
         return action, log_prob, mean_action
 
-    def evaluate_actions(self, obs, goal, actions):
+    def evaluate_actions(self, obs, goal, actions, eps=1e-6):
         dist = self.get_dist(obs, goal)
-        clamped_actions = torch.clamp(actions, -0.999999, 0.999999)
+        clamped_actions = torch.clamp(actions, -1.0+eps, 1.0-eps)
         pre_tanh = torch.atanh(clamped_actions)
         log_prob = dist.log_prob(pre_tanh)
         return self.reparam(log_prob, pre_tanh)
