@@ -14,7 +14,8 @@ __all__ = ["step_envs", "create_buffer", "filler", "low_level_sampler", "high_le
 
 
 CUBEA_SLICE = slice(0, 3)  # "cubeA_pos" indices in the state observation
-GRIPPER_TO_CUBEA_SLICE = slice(17, 20)  # "gripper_to_cubeA" indices in the state observation
+EEF_POS_SLICE = slice(46, 49)   # robot0_eef_pos
+#GRIPPER_TO_CUBEA_SLICE = slice(17, 20)  # "gripper_to_cubeA" indices in the state observation
 
 def vec_env(): # environment creation 
     def make_env():
@@ -32,24 +33,24 @@ def get_local_reward(state, next_state, hl_goal):
     cube_l = torch.linalg.norm((cube_pos_hl_goal - nx_cubea), dim=-1, keepdim=True)
     
     gripper_hl_goal = hl_goal[:, 3:]
-    nx_gripper = next_state[:, GRIPPER_TO_CUBEA_SLICE]
+    nx_gripper = next_state[:, EEF_POS_SLICE]
     gripper_l = torch.linalg.norm((gripper_hl_goal - nx_gripper), dim=-1, keepdim=True)
-    
+     
     reward = -(cube_l+gripper_l)
     observed_goal = torch.cat([nx_cubea, nx_gripper], dim=-1)
-    goal_assert = torch.stack((next_state[:, CUBEA_SLICE], next_state[:, GRIPPER_TO_CUBEA_SLICE])).permute(1,0,-1).flatten(1,-1)
-    return reward.squeeze(), observed_goal, goal_assert
+    #goal_assert = torch.stack((next_state[:, CUBEA_SLICE], next_state[:, EEF_POS_SLICE])).permute(1,0,-1).flatten(1,-1)
+    return reward.squeeze(), observed_goal
 
 
 def get_goals_obs(env):  # directly extract the goals values from the unwrapped environments (this is expensive than using slice on the state obs) 
     env_ = env.unwrapped.envs
     envs = [env.unwrapped for env in env_]
-    g = [torch.stack([torch.as_tensor([env._get_observations()["cubeA_pos"], env._get_observations()["gripper_to_cubeA"]])]) for env in envs]
+    g = [torch.stack([torch.as_tensor([env._get_observations()["cubeA_pos"], env._get_observations()["robot0_eef_pos"]])]) for env in envs]
     g = torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 6] with each row being flatten([cubeA_pos, gripper_to_cubeA])  
     return g
 
 
-def create_storage(): # for episodic data st500 // 10orage
+def create_storage(): # for episodic data storage
     obs_dim = (hypers.num_envs,hypers.obs_dim)     
     act_dim = (hypers.num_envs,hypers.ll_action_dim)
     return (
@@ -90,7 +91,7 @@ def step_envs(queue, hlp, llp, event_flag): # episode collection method
         pointer = 0
         global_step = 0
         obs = torch.from_numpy(env.reset()[0])
-        c = 10
+        c = hypers.c 
         while not event_flag.is_set():
             for n in range(hypers.horizon):
                 
@@ -108,7 +109,7 @@ def step_envs(queue, hlp, llp, event_flag): # episode collection method
                     action = action.squeeze()
                 
                 nx_state,env_reward,done,trunc,info = env.step(action.tolist())
-                local_reward, obs_goal, env_goal_1 = get_local_reward(obs, torch.as_tensor(nx_state), goal)
+                local_reward, obs_goal = get_local_reward(obs, torch.as_tensor(nx_state), goal)
        
                 stor_curr_states[n].copy_(obs)
                 stor_nx_states[n].copy_(torch.as_tensor(nx_state))
@@ -124,7 +125,7 @@ def step_envs(queue, hlp, llp, event_flag): # episode collection method
 
                 if n == hypers.horizon-1: 
                     env_goal_2 = get_goals_obs(env)
-                    assert torch.allclose(env_goal_1.float(), env_goal_2.float()), f"{env_goal_1, env_goal_2}"
+                    assert torch.allclose(obs_goal.float(), env_goal_2.float()), f"{env_goal_1, env_goal_2}"
                     
                     data = (
                         stor_curr_states, stor_nx_states, stor_rewards, stor_local_rewards, stor_dones, stor_actions, stor_hl_goals, stor_obs_goals
@@ -184,16 +185,16 @@ def high_level_sampler(buffer,high_gpu_stream):
     data = [(tensor.unsqueeze(-1) if tensor.dim() < 4 else tensor) for tensor in buffer]
     b_states, b_nx_states, b_rewards, _, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = data
 
-    gammas = (hypers.gamma ** torch.arange(10, device=hypers.device, dtype=torch.bfloat16)).view(1, 10, 1)
+    gammas = (hypers.gamma ** torch.arange(hypers.c, device=hypers.device, dtype=torch.bfloat16)).view(1, hypers.c, 1)
     
     while True:
         batch_idx = torch.randint(0, current_capacity, (1024,1)) # [1024, 1]
         #-
-        n_blocks = 500 // 10  
-        block_idx = torch.randint(0, n_blocks, (1024, 1)) * 10
-        horizon_idx = block_idx + torch.arange(10).unsqueeze(0)  # [1024, 10]
+        n_blocks = 500 // hypers.c
+        block_idx = torch.randint(0, n_blocks, (1024, 1)) * hypers.c
+        horizon_idx = block_idx + torch.arange(hypers.c).unsqueeze(0)  # [1024, 10]
         #-
-        env_idx = torch.randint(0, 10, (1024,1))                 # [1024, 1]
+        env_idx = torch.randint(0, hypers.c, (1024,1))                 # [1024, 1]
     
         # extracting sequence samples 
         s_states   = b_states[batch_idx, horizon_idx, env_idx]     # [1024, 10, 81]
