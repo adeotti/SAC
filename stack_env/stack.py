@@ -19,12 +19,6 @@ from networks import *
 from utils import *
 from configs import *
 
-
-# extract goals from the state
-def extract_goals(state, goal_indices=list(range(0, 3)) + list(range(17, 20))):
-    return state[..., goal_indices]
-
-
 class main:
     def __init__(self, storage_path):        
         self.init_hlp()
@@ -100,12 +94,11 @@ class main:
         _actions = _actions.unsqueeze(2).expand(-1, -1, 10, -1)  # [1024, 10,  1,  9]  -->  [1024, 10, 10,  9]
         _states = _states.expand(-1, -1, 10, -1)                 # [1024, 10,  1, 81]  -->  [1024, 10, 10, 81]
 
-        with torch.autocast(("cuda"), torch.bfloat16):
-            log = self.llp.evaluate_actions(_states, g_stack, _actions)  # [1024, 10, 10, 1]
+        log = self.llp.evaluate_actions(_states, g_stack, _actions)  # [1024, 10, 10, 1]
         log = torch.sum(log, dim=1, keepdim=True)                        # [1024,  1, 10, 1]
         arg_max = torch.argmax(log, dim=2, keepdim=True)                 # [1024,  1,  1, 1] 
     
-        idx = arg_max.expand(-1, 10, -1, 6)                              # [1024, 10,  1, 6] 
+        idx = arg_max.expand(-1, 10, -1, hypers.hl_action_dim)                              # [1024, 10,  1, 6] 
         _hl_goals = torch.take_along_dim(g_stack, idx, dim=2).squeeze(2) # [1024, 10,  6]
         return _hl_goals
 
@@ -120,29 +113,24 @@ class main:
             with torch.cuda.stream(low_stream):
                 _states, _nx_states, _local_reward, _dones, _actions, _hl_goals, _obs_goals = low_gpu_stream.get()
 
+                with torch.no_grad():  
+                    nx_actions, log_nx_actions,_ = self.llp(_nx_states, _hl_goals)
+                    q1 = q1_target_net(_nx_states, nx_actions, _hl_goals)
+                    q2 = q2_target_net(_nx_states, nx_actions, _hl_goals)
+                    q_target = self.compute_q_target(q1, q2, log_nx_actions, _local_reward, _dones, ll_alpha)
+                                         
+                q1_pred = q1_net(_states, _actions, _hl_goals) 
+                q2_pred = q2_net(_states, _actions, _hl_goals)
+                ll_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
                 self.ql_optim.zero_grad()
-                self.llp_optim.zero_grad()
-
-                with torch.autocast(("cuda"), torch.bfloat16):
-                    with torch.no_grad():  
-                        nx_actions, log_nx_actions,_ = self.llp(_nx_states, _hl_goals)
-                        q1 = q1_target_net(_nx_states, nx_actions, _hl_goals)
-                        q2 = q2_target_net(_nx_states, nx_actions, _hl_goals)
-                        q_target = self.compute_q_target(q1, q2, log_nx_actions, _local_reward, _dones, ll_alpha)
-                                             
-                    q1_pred = q1_net(_states, _actions, _hl_goals) 
-                    q2_pred = q2_net(_states, _actions, _hl_goals)
-                    ll_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
-
                 ll_q_loss.backward()
                 self.ql_optim.step()
                                     
-                with torch.autocast(("cuda"), torch.bfloat16):
-                    new_action,log_pi,_ = self.llp(_states,_hl_goals)
-                    q1 = q1_net(_states, new_action, _hl_goals)
-                    q2 = q2_net(_states, new_action, _hl_goals)
-                    ll_policy_loss, min_q = self.get_policy_loss(q1, q2, ll_alpha, log_pi)  
-                    
+                new_action,log_pi,_ = self.llp(_states,_hl_goals)
+                q1 = q1_net(_states, new_action, _hl_goals)
+                q2 = q2_net(_states, new_action, _hl_goals)
+                ll_policy_loss, min_q = self.get_policy_loss(q1, q2, ll_alpha, log_pi)  
+                self.llp_optim.zero_grad()
                 ll_policy_loss.backward()
                 self.llp_optim.step()
 
@@ -155,6 +143,8 @@ class main:
                 ll_alpha = self.tune_alpha(self.ll_log_alpha, log_pi, self.ll_entropy_target, self.ll_alpha_optim)
                 
                 if n % int(1e4) == 0:
+                    low_stream.synchronize()
+
                     mlflow.log_metrics(
                         {   
                             "Low Level/low level critic min q": min_q.mean().item(),
@@ -184,29 +174,24 @@ class main:
                 _states = _states[:,0,:]
                 _hl_goals = _hl_goals[:,0,:]
                 
-                self.qh.zero_grad()
-                self.hlp_optim.zero_grad()
-
-                with torch.autocast(("cuda"), torch.bfloat16):
-                    with torch.no_grad():
-                        nx_actions, log_nx_actions,_ = self.hlp(_nx_states)
-                        q1 = q1_target_net(_nx_states, nx_actions)
-                        q2 = q2_target_net(_nx_states, nx_actions)
-                        q_target = self.compute_q_target(q1, q2, log_nx_actions, _reward, _dones, hl_alpha, exp=10)
+                with torch.no_grad():
+                    nx_actions, log_nx_actions,_ = self.hlp(_nx_states)
+                    q1 = q1_target_net(_nx_states, nx_actions)
+                    q2 = q2_target_net(_nx_states, nx_actions)
+                    q_target = self.compute_q_target(q1, q2, log_nx_actions, _reward, _dones, hl_alpha, exp=10)
              
-                    q1_pred = q1_net(_states, _hl_goals)
-                    q2_pred = q2_net(_states, _hl_goals)
-                    hl_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target)
-     
+                q1_pred = q1_net(_states, _hl_goals)
+                q2_pred = q2_net(_states, _hl_goals)
+                hl_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
+                self.qh.zero_grad()
                 hl_q_loss.backward()
                 self.qh_optim.step()
 
-                with torch.autocast(("cuda"), torch.bfloat16):
-                    new_action,log_pi,_ = self.hlp(_states)
-                    q1 = q1_net(_states, new_action)
-                    q2 = q2_net(_states, new_action)
-                    hl_policy_loss, min_q = self.get_policy_loss(q1, q2, hl_alpha, log_pi)  # alpla * log policy(at|st) - min(Q_(1,2)(st,g_t)) 
-
+                new_action,log_pi,_ = self.hlp(_states)
+                q1 = q1_net(_states, new_action)
+                q2 = q2_net(_states, new_action)
+                hl_policy_loss, min_q = self.get_policy_loss(q1, q2, hl_alpha, log_pi)  
+                self.hlp_optim.zero_grad()
                 hl_policy_loss.backward()
                 self.hlp_optim.step()
                 
@@ -219,6 +204,8 @@ class main:
                 hl_alpha = self.tune_alpha(self.hl_log_alpha, log_pi, self.hl_entropy_target, self.hl_alpha_optim)
                 
                 if  n % int(1e4) == 0:
+                    high_stream.synchronize()
+
                     mlflow.log_metrics(
                         {   
                             "High Level/high level critic min q": min_q.mean().item(),
