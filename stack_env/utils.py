@@ -10,12 +10,10 @@ from configs import *
 from networks import *
 
 
-__all__ = ["step_envs", "create_buffer", "filler", "low_level_sampler", "high_level_sampler"]
+__all__ = ["step_envs", "create_buffer", "filler", "low_level_sampler", "high_level_sampler", "extract_goals"]
 
 
-CUBEA_SLICE = slice(0, 3)  # "cubeA_pos" indices in the state observation
 EEF_POS_SLICE = slice(46, 49)   # robot0_eef_pos
-#GRIPPER_TO_CUBEA_SLICE = slice(17, 20)  # "gripper_to_cubeA" indices in the state observation
 
 def vec_env(): # environment creation 
     def make_env():
@@ -28,25 +26,21 @@ def vec_env(): # environment creation
 
 
 def get_local_reward(state, next_state, hl_goal):
-    cube_pos_hl_goal = hl_goal[:, :3]
-    nx_cubea = next_state[:, CUBEA_SLICE]
-    cube_l = torch.linalg.norm((cube_pos_hl_goal - nx_cubea), dim=-1, keepdim=True)
-    
-    gripper_hl_goal = hl_goal[:, 3:]
-    nx_gripper = next_state[:, EEF_POS_SLICE]
-    gripper_l = torch.linalg.norm((gripper_hl_goal - nx_gripper), dim=-1, keepdim=True)
-     
-    reward = -(cube_l+gripper_l)
-    observed_goal = torch.cat([nx_cubea, nx_gripper], dim=-1)
-    #goal_assert = torch.stack((next_state[:, CUBEA_SLICE], next_state[:, EEF_POS_SLICE])).permute(1,0,-1).flatten(1,-1)
-    return reward.squeeze(), observed_goal
+    eef_pos_hl = hl_goal[:, EEF_POS_SLICE]
+    nx_eef_pos = next_state[:, EEF_POS_SLICE]
+    reward =-(torch.linalg.norm((hl_goal - nx_cubeb), dim=-1, keepdim=True))
+    return reward.squeeze(), nx_eef_pos
+
+
+def extract_goals(state, goal_indices=list(range(46, 49))):  # extract hlgoal from state, used in goal relabeling
+    return state[..., goal_indices]
 
 
 def get_goals_obs(env):  # directly extract the goals values from the unwrapped environments (this is expensive than using slice on the state obs) 
     env_ = env.unwrapped.envs
     envs = [env.unwrapped for env in env_]
-    g = [torch.stack([torch.as_tensor([env._get_observations()["cubeA_pos"], env._get_observations()["robot0_eef_pos"]])]) for env in envs]
-    g = torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 6] with each row being flatten([cubeA_pos, gripper_to_cubeA])  
+    g = [torch.stack([torch.as_tensor([env._get_observations()["robot0_eef_pos"]])]) for env in envs] 
+    g = torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 3]   
     return g
 
 
@@ -54,14 +48,14 @@ def create_storage(): # for episodic data storage
     obs_dim = (hypers.num_envs,hypers.obs_dim)     
     act_dim = (hypers.num_envs,hypers.ll_action_dim)
     return (
-        torch.empty((hypers.horizon, *obs_dim), dtype=torch.bfloat16),   # states
-        torch.empty((hypers.horizon, *obs_dim), dtype=torch.bfloat16),   # nx states
-        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.bfloat16),   # environment reward
-        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.bfloat16),   # local reward (L2 norm)
+        torch.empty((hypers.horizon, *obs_dim), dtype=torch.float),   # states
+        torch.empty((hypers.horizon, *obs_dim), dtype=torch.float),   # nx states
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.float),   # environment reward
+        torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.float),   # local reward (L2 norm)
         torch.empty((hypers.horizon, hypers.num_envs,), dtype=torch.bool),   # done
-        torch.empty((hypers.horizon, *act_dim), dtype=torch.bfloat16),           # actions
-        torch.empty((hypers.horizon, hypers.num_envs, 6), dtype=torch.bfloat16), # hl goal 
-        torch.empty((hypers.horizon, hypers.num_envs, 6), dtype=torch.bfloat16)  # observed goal
+        torch.empty((hypers.horizon, *act_dim), dtype=torch.float),           # actions
+        torch.empty((hypers.horizon, hypers.num_envs, hypers.hl_action_dim), dtype=torch.float), # hl goal 
+        torch.empty((hypers.horizon, hypers.num_envs, hypers.hl_action_dim), dtype=torch.float)  # observed goal
     )
 
 
@@ -71,14 +65,14 @@ def create_buffer(): # circular buffer
     act_dim = (hypers.num_envs, hypers.ll_action_dim)
     goal_dim = (hypers.num_envs, hypers.hl_action_dim)
     return (
-        torch.zeros((n_batch, hypers.horizon, *obs_dim), dtype=torch.bfloat16, device=hypers.device),         # states
-        torch.zeros((n_batch, hypers.horizon, *obs_dim), dtype=torch.bfloat16, device=hypers.device),         # nx states
-        torch.zeros((n_batch, hypers.horizon, hypers.num_envs), dtype=torch.bfloat16, device=hypers.device),  # environment rewards
-        torch.zeros((n_batch, hypers.horizon, hypers.num_envs), dtype=torch.bfloat16, device=hypers.device),  # local rewards
+        torch.zeros((n_batch, hypers.horizon, *obs_dim), dtype=torch.float, device=hypers.device),         # states
+        torch.zeros((n_batch, hypers.horizon, *obs_dim), dtype=torch.float, device=hypers.device),         # nx states
+        torch.zeros((n_batch, hypers.horizon, hypers.num_envs), dtype=torch.float, device=hypers.device),  # environment rewards
+        torch.zeros((n_batch, hypers.horizon, hypers.num_envs), dtype=torch.float, device=hypers.device),  # local rewards
         torch.zeros((n_batch, hypers.horizon, hypers.num_envs,), dtype=torch.bool, device=hypers.device), # done
-        torch.zeros((n_batch, hypers.horizon, *act_dim), dtype=torch.bfloat16, device=hypers.device),   # actions
-        torch.zeros((n_batch, hypers.horizon, *goal_dim), dtype=torch.bfloat16, device=hypers.device),  # hl goals
-        torch.zeros((n_batch, hypers.horizon, *goal_dim), dtype=torch.bfloat16, device=hypers.device),  # observed goals
+        torch.zeros((n_batch, hypers.horizon, *act_dim), dtype=torch.float, device=hypers.device),   # actions
+        torch.zeros((n_batch, hypers.horizon, *goal_dim), dtype=torch.float, device=hypers.device),  # hl goals
+        torch.zeros((n_batch, hypers.horizon, *goal_dim), dtype=torch.float, device=hypers.device),  # observed goals
         torch.tensor(0)  # current buffer capacity
     ) 
 
@@ -185,7 +179,7 @@ def high_level_sampler(buffer,high_gpu_stream):
     data = [(tensor.unsqueeze(-1) if tensor.dim() < 4 else tensor) for tensor in buffer]
     b_states, b_nx_states, b_rewards, _, b_dones, b_actions, b_hl_goals, b_obs_goals, current_capacity = data
 
-    gammas = (hypers.gamma ** torch.arange(hypers.c, device=hypers.device, dtype=torch.bfloat16)).view(1, hypers.c, 1)
+    gammas = (hypers.gamma ** torch.arange(hypers.c, device=hypers.device, dtype=torch.float)).view(1, hypers.c, 1)
     
     while True:
         batch_idx = torch.randint(0, current_capacity, (1024,1)) # [1024, 1]
