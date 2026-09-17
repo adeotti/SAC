@@ -33,12 +33,12 @@ class HLP(nn.Module):
         dist = Normal(mean,std) 
         
         pre_tanh = dist.rsample()
-        action = F.tanh(pre_tanh) 
+        action = F.tanh(pre_tanh) * 1.5 
         log = dist.log_prob(pre_tanh)
         log -=  2 * (np.log(2) - pre_tanh - F.softplus(-2 * pre_tanh))  
         log = log.sum(dim=-1,keepdim=True)  
 
-        scaled_mean = torch.tanh(mean) #* 5.0
+        scaled_mean = torch.tanh(mean) * 1.5
         return action, log, scaled_mean
 
 
