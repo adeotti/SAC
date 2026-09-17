@@ -13,7 +13,9 @@ from networks import *
 __all__ = ["step_envs", "create_buffer", "filler", "low_level_sampler", "high_level_sampler", "extract_goals"]
 
 
-EEF_POS_SLICE = slice(46, 49)   # robot0_eef_pos
+CUBE_A_CUBE_B = slice(7, 10)   # cubeA_to_cubeB
+EEF_POS_SLICE = slice(23, 26)  # robot0_eef_pos
+
 
 def vec_env(): # environment creation 
     def make_env():
@@ -25,22 +27,22 @@ def vec_env(): # environment creation
     return SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
 
 
-def get_local_reward(state, next_state, hl_goal):
-    eef_pos_hl = hl_goal[:, EEF_POS_SLICE]
-    nx_eef_pos = next_state[:, EEF_POS_SLICE]
-    reward =-(torch.linalg.norm((hl_goal - nx_cubeb), dim=-1, keepdim=True))
-    return reward.squeeze(), nx_eef_pos
+def get_local_reward(next_state, hl_goal):
+    nx_target = torch.cat([next_state[:, CUBE_A_CUBE_B], next_state[:, EEF_POS_SLICE]], dim=-1)
+    assert nx_target.shape == hl_goal.shape, f"{nx_target.shape, hl_goal.shape}"
+    reward =-(torch.linalg.norm((hl_goal - nx_target), dim=-1, keepdim=True))
+    return reward.squeeze(), nx_target
 
 
-def extract_goals(state, goal_indices=list(range(46, 49))):  # extract hlgoal from state, used in goal relabeling
+def extract_goals(state, goal_indices=list(range(7, 10)) + list(range(46, 49))):  # extract hlgoal from state, used in goal relabeling
     return state[..., goal_indices]
 
 
 def get_goals_obs(env):  # directly extract the goals values from the unwrapped environments (this is expensive than using slice on the state obs) 
     env_ = env.unwrapped.envs
     envs = [env.unwrapped for env in env_]
-    g = [torch.stack([torch.as_tensor([env._get_observations()["robot0_eef_pos"]])]) for env in envs] 
-    g = torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 3]   
+    g = [torch.stack([torch.as_tensor([env._get_observations()["cubeA_to_cubeB"], env._get_observations()["robot0_eef_pos"]])]) for env in envs] 
+    g = torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 6]   
     return g
 
 
@@ -103,7 +105,9 @@ def step_envs(queue, hlp, llp, event_flag): # episode collection method
                     action = action.squeeze()
                 
                 nx_state,env_reward,done,trunc,info = env.step(action.tolist())
-                local_reward, obs_goal = get_local_reward(obs, torch.as_tensor(nx_state), goal)
+                local_reward, obs_goal = get_local_reward(torch.as_tensor(nx_state), goal)
+
+                assert torch.equal(obs_goal.float(), get_goals_obs(env).float()), f"{obs_goal.shape, get_goals_obs(env).float().shape}"
        
                 stor_curr_states[n].copy_(obs)
                 stor_nx_states[n].copy_(torch.as_tensor(nx_state))
@@ -117,10 +121,7 @@ def step_envs(queue, hlp, llp, event_flag): # episode collection method
                 obs = nx_state
                 global_step += 1
 
-                if n == hypers.horizon-1: 
-                    env_goal_2 = get_goals_obs(env)
-                    assert torch.allclose(obs_goal.float(), env_goal_2.float()), f"{env_goal_1, env_goal_2}"
-                    
+                if n == hypers.horizon-1:  
                     data = (
                         stor_curr_states, stor_nx_states, stor_rewards, stor_local_rewards, stor_dones, stor_actions, stor_hl_goals, stor_obs_goals
                     )
@@ -188,7 +189,7 @@ def high_level_sampler(buffer,high_gpu_stream):
         block_idx = torch.randint(0, n_blocks, (1024, 1)) * hypers.c
         horizon_idx = block_idx + torch.arange(hypers.c).unsqueeze(0)  # [1024, 10]
         #-
-        env_idx = torch.randint(0, hypers.c, (1024,1))                 # [1024, 1]
+        env_idx = torch.randint(0, hypers.num_envs, (1024,1))                 # [1024, 1]
     
         # extracting sequence samples 
         s_states   = b_states[batch_idx, horizon_idx, env_idx]     # [1024, 10, 81]
