@@ -95,10 +95,10 @@ class main:
         _states = _states.expand(-1, -1, 10, -1)                 # [1024, 10,  1, 81]  -->  [1024, 10, 10, 81]
 
         log = self.llp.evaluate_actions(_states, g_stack, _actions)  # [1024, 10, 10, 1]
-        log = torch.sum(log, dim=1, keepdim=True)                        # [1024,  1, 10, 1]
-        arg_max = torch.argmax(log, dim=2, keepdim=True)                 # [1024,  1,  1, 1] 
+        log = torch.sum(log, dim=1, keepdim=True)                    # [1024,  1, 10, 1]
+        arg_max = torch.argmax(log, dim=2, keepdim=True)             # [1024,  1,  1, 1] 
     
-        idx = arg_max.expand(-1, 10, -1, hypers.hl_action_dim)                              # [1024, 10,  1, 6] 
+        idx = arg_max.expand(-1, 10, -1, hypers.hl_action_dim)           # [1024, 10,  1, 6] 
         _hl_goals = torch.take_along_dim(g_stack, idx, dim=2).squeeze(2) # [1024, 10,  6]
         return _hl_goals
 
