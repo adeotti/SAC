@@ -34,7 +34,7 @@ def get_local_reward(next_state, hl_goal):
     return reward.squeeze(), nx_target
 
 
-def extract_goals(state, goal_indices=list(range(7, 10)) + list(range(46, 49))):  # extract hlgoal from state, used in goal relabeling
+def extract_goals(state, goal_indices=list(range(7, 10)) + list(range(23, 26))):  # extract hlgoal from state, used in goal relabeling
     return state[..., goal_indices]
 
 
@@ -42,9 +42,8 @@ def get_goals_obs(env):  # directly extract the goals values from the unwrapped 
     env_ = env.unwrapped.envs
     envs = [env.unwrapped for env in env_]
     g = [torch.stack([torch.as_tensor([env._get_observations()["cubeA_to_cubeB"], env._get_observations()["robot0_eef_pos"]])]) for env in envs] 
-    g = torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 6]   
-    return g
-
+    return torch.stack(g).flatten(1,-1).squeeze() # layout : shape [n envs, 6]   
+    
 
 def create_storage(): # for episodic data storage
     obs_dim = (hypers.num_envs,hypers.obs_dim)     
@@ -183,22 +182,22 @@ def high_level_sampler(buffer,high_gpu_stream):
     gammas = (hypers.gamma ** torch.arange(hypers.c, device=hypers.device, dtype=torch.float)).view(1, hypers.c, 1)
     
     while True:
-        batch_idx = torch.randint(0, current_capacity, (1024,1)) # [1024, 1]
+        batch_idx = torch.randint(0, current_capacity, (1024,1))       # [1024, 1]
         #-
         n_blocks = 500 // hypers.c
         block_idx = torch.randint(0, n_blocks, (1024, 1)) * hypers.c
         horizon_idx = block_idx + torch.arange(hypers.c).unsqueeze(0)  # [1024, 10]
         #-
-        env_idx = torch.randint(0, hypers.num_envs, (1024,1))                 # [1024, 1]
+        env_idx = torch.randint(0, hypers.num_envs, (1024,1))          # [1024, 1]
     
         # extracting sequence samples 
         s_states   = b_states[batch_idx, horizon_idx, env_idx]     # [1024, 10, 81]
         s_nx_states = b_nx_states[batch_idx, horizon_idx, env_idx] # [1024, 10, 81]
-        s_rewards = b_rewards[batch_idx, horizon_idx, env_idx]     # [1024, 10, 1] 
-        s_dones = b_dones[batch_idx, horizon_idx, env_idx]         # [1024, 10, 1]
-        s_actions  = b_actions[batch_idx, horizon_idx, env_idx]    # [1024, 10, 9]
-        s_hl_goals = b_hl_goals[batch_idx, horizon_idx, env_idx]   # [1024, 10, 6]
-        s_obs_goals = b_obs_goals[batch_idx, horizon_idx, env_idx] # [1024, 10, 6]
+        s_rewards = b_rewards[batch_idx, horizon_idx, env_idx]     # [1024, 10,  1] 
+        s_dones = b_dones[batch_idx, horizon_idx, env_idx]         # [1024, 10,  1]
+        s_actions  = b_actions[batch_idx, horizon_idx, env_idx]    # [1024, 10,  9]
+        s_hl_goals = b_hl_goals[batch_idx, horizon_idx, env_idx]   # [1024, 10,  6]
+        s_obs_goals = b_obs_goals[batch_idx, horizon_idx, env_idx] # [1024, 10,  6]
         #-
         s_nx_states = s_nx_states[:, -1, :]                               # [1024, 81]
         s_rewards = (s_rewards * gammas).sum(dim=1)                       # [1024, 1] discounting and summing reward on dim 1 
