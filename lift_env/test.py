@@ -16,7 +16,7 @@ env = robosuite.make(
     has_renderer=True,
     has_offscreen_renderer=False,
     use_camera_obs=False,
-    horizon = 500,
+    horizon = 300,
     control_freq = 20
 )
 env = GymWrapper(env,list(env.observation_spec()))
@@ -24,10 +24,10 @@ env = GymWrapper(env,list(env.observation_spec()))
 obs = env.reset()[0]
 policy = Actor()
 
-checkpoint = torch.load("./model.pth",map_location="cpu",weights_only=False) 
+checkpoint = torch.load("./model_1.pth",map_location="cpu",weights_only=False) 
 policy.load_state_dict(checkpoint["actor state"])
 
-for i in range(500*30):
+for i in range(300*30):
     _,_,action = policy(torch.from_numpy(obs).float())
     obs,reward,done,trunc,info = env.step(action.detach().numpy())
     env.render()
