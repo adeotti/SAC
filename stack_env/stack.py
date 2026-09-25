@@ -23,6 +23,10 @@ class main:
     def __init__(self, storage_path):        
         self.init_hlp()
         self.init_llp()
+        
+        for net in (*self.qh, *self.ql):
+            net.compile(mode="max-autotune-no-cudagraphs")
+
         self.storage_path = storage_path
         self.n = 0
 
@@ -34,8 +38,7 @@ class main:
         self.qh = nn.ModuleList([HL_Critic() for _ in range(2)]).to(hypers.device)
         self.qh_target = nn.ModuleList([deepcopy(net) for net in self.qh]).to(hypers.device)
         self.qh_optim = Adam(self.qh.parameters(), lr=hypers.critic_lr, fused=True)
-        self.qh.compile(mode="max-autotune")
-
+        
         self.hl_entropy_target = -hypers.hl_action_dim
         self.hl_log_alpha = torch.tensor(1.0,requires_grad=True, device=hypers.device)  
         self.hl_alpha_optim = Adam([self.hl_log_alpha], lr=hypers.alpha_lr)
@@ -48,8 +51,7 @@ class main:
         self.ql = nn.ModuleList([LL_Critic() for _ in range(2)]).to(hypers.device)
         self.ql_target = nn.ModuleList([deepcopy(net) for net in self.ql]).to(hypers.device)
         self.ql_optim = Adam(self.ql.parameters(), lr=hypers.critic_lr, fused=True)
-        self.ql.compile(mode="max-autotune")
-
+        
         self.ll_entropy_target = -hypers.ll_action_dim
         self.ll_log_alpha = torch.tensor(1.0,requires_grad=True, device=hypers.device)  
         self.ll_alpha_optim = Adam([self.ll_log_alpha], lr=hypers.alpha_lr)
@@ -68,7 +70,7 @@ class main:
 
     def get_critics_loss(self, q1_pred, q2_pred, q_target):    
         assert q1_pred.shape == q2_pred.shape == q_target.shape 
-        return F.smooth_l1_loss(q1_pred, q_target) + F.smooth_l1_loss(q2_pred, q_target)
+        return F.smooth_l1_loss(q1_pred, q_target), F.smooth_l1_loss(q2_pred, q_target)
         
     def get_policy_loss(self, q1, q2, alpha, log_pi):
         assert q1.shape == q2.shape == log_pi.shape
@@ -86,7 +88,7 @@ class main:
     def relabel_goals(self, _hl_goals, _states, _nx_states, _actions): 
         _states = _states.unsqueeze(2)
         sample_1 = _hl_goals.unsqueeze(1).unsqueeze(1)                                           # [1024, 1, 1, 6]
-        sample_2 = (extract_goals(_nx_states.unsqueeze(1)) - extract_goals(_states[:, 0, :, :])) # [1024, 1, 6]
+        sample_2 = extract_goals(_nx_states.unsqueeze(1))                                        # [1024, 1, 6]
         sample_3 = Normal(loc=sample_2, scale=0.5).sample((8,)).permute(1, 2, 0, -1)             # [8, 1024, 6]     -->   [1024, 1, 8, 6]
         g_stack = torch.cat([sample_1, sample_2.unsqueeze(1), sample_3], dim=2)                  # [1024, 1, 10, 6]
         
@@ -119,6 +121,10 @@ class main:
                     q2 = q2_target_net(_nx_states, nx_actions, _hl_goals)
                     q_target = self.compute_q_target(q1, q2, log_nx_actions, _local_reward, _dones, ll_alpha)
                                          
+                q1_pred = q1_net(_states, _actions, _hl_goals) 
+                q2_pred = q2_net(_states, _actions, _hl_goals)
+                q1_loss, q2_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
+                
                 q1_pred = q1_net(_states, _actions, _hl_goals) 
                 q2_pred = q2_net(_states, _actions, _hl_goals)
                 ll_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
@@ -180,6 +186,10 @@ class main:
                     q2 = q2_target_net(_nx_states, nx_actions)
                     q_target = self.compute_q_target(q1, q2, log_nx_actions, _reward, _dones, hl_alpha, exp=10)
              
+                q1_pred = q1_net(_states, _hl_goals)
+                q2_pred = q2_net(_states, _hl_goals)
+                q1_loss, q2_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
+                
                 q1_pred = q1_net(_states, _hl_goals)
                 q2_pred = q2_net(_states, _hl_goals)
                 hl_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
