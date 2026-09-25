@@ -16,11 +16,13 @@ __all__ = ["step_envs", "create_buffer", "filler", "low_level_sampler", "high_le
 CUBE_A_CUBE_B = slice(7, 10)   # cubeA_to_cubeB
 EEF_POS_SLICE = slice(23, 26)  # robot0_eef_pos
 
+scale = 0.4
+
 
 def vec_env(): # environment creation 
     def make_env():
         x = robosuite.make(env_name="Stack", **env_configs) 
-        x = GymWrapper(x, sorted(list(x.active_observables)))
+        x = GymWrapper(x)
         x.metadata = {"render_mode":[]}
         x = Autoreset(x)
         return x 
@@ -30,7 +32,10 @@ def vec_env(): # environment creation
 def get_local_reward(next_state, hl_goal):
     nx_target = torch.cat([next_state[:, CUBE_A_CUBE_B], next_state[:, EEF_POS_SLICE]], dim=-1)
     assert nx_target.shape == hl_goal.shape, f"{nx_target.shape, hl_goal.shape}"
-    reward =-(torch.linalg.norm((hl_goal - nx_target), dim=-1, keepdim=True))
+
+    cube_loss = torch.linalg.norm((next_state[:, CUBE_A_CUBE_B] - hl_goal[:, :3]), dim=-1, keepdim=True) / scale
+    eef_loss = torch.linalg.norm((next_state[:, EEF_POS_SLICE] - hl_goal[:, 3:]), dim=-1, keepdim=True)  / scale
+    reward = -(cube_loss + eef_loss) 
     return reward.squeeze(), nx_target
 
 
@@ -116,7 +121,7 @@ def step_envs(queue, hlp, llp, event_flag): # episode collection method
                 stor_actions[n].copy_(torch.as_tensor(action))
                 stor_hl_goals[n].copy_(goal)
                 stor_obs_goals[n].copy_(obs_goal)
-
+                
                 obs = nx_state
                 global_step += 1
 
@@ -150,8 +155,15 @@ def filler(buffer, episodes_queue, mlflow_run_id): # method used by a wroker to 
         global_idx += 1
         current_capacity.copy_(torch.tensor(min(global_idx, n_batch)))
         
-        mean_return = ep_rewards.sum().item() / hypers.num_envs # tracking rewards per episodes
-        mlflow.log_metric("Main/mean reward", mean_return,run_id=mlflow_run_id, step=global_idx) 
+        mean_return = ep_rewards.sum().item() / hypers.num_envs # tracking env rewards per episodes
+        mean_local = ep_local_rewards.sum().item() / hypers.num_envs # tracking local rewards per episodes
+        mlflow.log_metrics(
+                {
+                    "Main/mean reward": mean_return,
+                    "Main/mean local reward": mean_local
+                },
+                run_id=mlflow_run_id, step=global_idx
+        ) 
         
 
 def low_level_sampler(buffer,low_gpu_stream): # method used by a worker to sample from the buffer then put the sample in a queue
@@ -182,10 +194,10 @@ def high_level_sampler(buffer,high_gpu_stream):
     gammas = (hypers.gamma ** torch.arange(hypers.c, device=hypers.device, dtype=torch.float)).view(1, hypers.c, 1)
     
     while True:
-        batch_idx = torch.randint(0, current_capacity, (1024,1))       # [1024, 1]
+        batch_idx = torch.randint(0, current_capacity, (hypers.batch_size, 1))       # [1024, 1]
         #-
-        n_blocks = 500 // hypers.c
-        block_idx = torch.randint(0, n_blocks, (1024, 1)) * hypers.c
+        n_blocks = hypers.horizon // hypers.c
+        block_idx = torch.randint(0, n_blocks, (hypers.batch_size, 1)) * hypers.c
         horizon_idx = block_idx + torch.arange(hypers.c).unsqueeze(0)  # [1024, 10]
         #-
         env_idx = torch.randint(0, hypers.num_envs, (1024,1))          # [1024, 1]
