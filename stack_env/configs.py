@@ -7,7 +7,6 @@ __all__ = ["hypers", "env_configs"]
 @dataclass(frozen=True)
 class Hypers:
     ROBOT = "Panda"
-    env_name = None
     device = torch.device("cuda:0")
     obs_dim = 81   
     ll_action_dim = 9  # low level action dim
@@ -24,7 +23,7 @@ class Hypers:
     horizon = 500
     buffer_size = 100  # 100*horizon = 50k steps
     num_rollout_workers = 10
-    warmup = 20_000 // (num_rollout_workers*num_envs)
+    warmup = 20_000 // num_rollout_workers*num_envs
     low_queue_maxsize = 10 
     high_queue_maxsize = 10
     buffer_min_capacity = 20 # min buffer capacity before starting sampling
@@ -40,7 +39,7 @@ env_configs = {
     "has_renderer": False,
     "use_camera_obs": False,
     "has_offscreen_renderer": False,
-    "reward_shaping": True,  # Dense rewards env version 
+    "reward_shaping": True,     # Dense rewards env version 
     "horizon": hypers.horizon,  # Max steps before reset or trunc = True
     "control_freq": 20,
     "reward_scale": 1.0
