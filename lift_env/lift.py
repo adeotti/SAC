@@ -7,6 +7,7 @@ from robosuite import load_composite_controller_config
 from robosuite.wrappers.gym_wrapper import GymWrapper
 from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers.common import Autoreset
+from gymnasium import RewardWrapper
 
 import torch,sys,time,mlflow,queue
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ from torch.optim import Adam
 import numpy as np
 import torch.multiprocessing as mp
 
+from itertools import chain
 from copy import deepcopy
 from tqdm import tqdm
 from dataclasses import dataclass
@@ -26,8 +28,8 @@ from threading import Thread
 class Hypers:
     ROBOT = "Panda"
     env_name = None
-    device = torch.device("cuda:0")
-    obs_dim = 136      # observation space, dim -1 ,162 for stack 
+    device = torch.device("cuda:1")
+    obs_dim = 68      # observation space
     action_dim = 9     # action space for a single env 
     batch_size = 1024
     lr = 3e-4
@@ -55,16 +57,48 @@ env_configs = {
     "reward_scale":1.0
     }
 
+
+class RewardW(RewardWrapper): # modified reward function from robosuite lift source code
+    def __init__(self, env):
+        super().__init__(env)
+
+    def reward(self, reward_scale=1.0): 
+        """
+        - Reaching: in [0, 1], to encourage the arm to reach the cube
+        - Grasping: in {0, 0.25}, non-zero if arm is grasping the cube
+        - Lifting: in {0, 1}, non-zero if arm has lifted the cube
+        """
+        robosuite_env = self.env.unwrapped
+        reward = 0.0
+
+        dist = robosuite_env._gripper_to_target(
+            gripper= robosuite_env.robots[0].gripper, target=robosuite_env.cube.root_body, target_type="body", return_distance=True
+        )
+        reaching_reward = 1 - np.tanh(10.0 * dist)
+        reward += reaching_reward
+
+        if robosuite_env._check_grasp(gripper=robosuite_env.robots[0].gripper, object_geoms=robosuite_env.cube): # grasping reward
+            reward += 0.25
+    
+        cube_height = robosuite_env.sim.data.body_xpos[robosuite_env.cube_body_id][2]  # lifting reward
+        table_height = robosuite_env.model.mujoco_arena.table_offset[2]
+
+        lift = cube_height - table_height
+        max_lift = 0.10  # allowed height above the table (m)
+        if lift > max_lift:
+            reward -= 5.0 * (lift - max_lift)  # grows the higher it goes
+        reward *= reward_scale / 2.25  
+        return reward
+
+
 def vec_env():
     def make_env():
-        x = suite.make(env_name = "Lift",**env_configs) # Lift
-        x = GymWrapper(x,list(x.observation_spec()))
-        # observation_spec() create duplicate data point in the returned state observation,
-        # switch to x.active_observables and set hypers.obs_dim to 68 to avoid wasting compute by training on duplicated data point
+        x = suite.make(env_name = "Lift",**env_configs) 
+        x = GymWrapper(x)
         x.metadata = {"render_mode":[]}
+        # x = RewardW(x), not tested
         x = Autoreset(x)
         return x
-    
     env = SyncVectorEnv([make_env for _ in range(hypers.num_envs)])
     return env
 
@@ -150,7 +184,7 @@ def step(queue,policy): # main method for stepping in the envs and collecting tr
                 action = action.squeeze()
              
             nx_state,reward,done,trunc,info = env.step(action.tolist())
-            
+     
             saved_action = (torch.from_numpy(np.array(action)) if isinstance(action,np.ndarray) else action)
             
             stor_curr_states[pointer].copy_(torch.as_tensor(obs))
@@ -242,7 +276,6 @@ def print_queue_loading(queue): # tracking queue size mainly during warmup phase
     pbar.close()
 
 
-
 class main:
     def __init__(self,storage_path):
         self.actor = Actor().to(hypers.device)
@@ -255,11 +288,8 @@ class main:
         self.actor.compile(mode="max-autotune")
         self.q1.compile()
         self.q2.compile()
-        self.q1_target.compile()
-        self.q2_target.compile()
 
-        self.q1_optim = Adam(self.q1.parameters(),lr=hypers.lr,fused=True)
-        self.q2_optim = Adam(self.q2.parameters(),lr=hypers.lr,fused=True)
+        self.q_optim = Adam(chain(self.q1.parameters(), self.q2.parameters()), lr=hypers.lr, fused=True)
 
         self.entropy_target = -hypers.action_dim
         self.log_alpha = torch.tensor(1.0,requires_grad=True,device=hypers.device)  
@@ -270,49 +300,16 @@ class main:
             
     
     def save(self,step):
-        check = {
-            "actor state":self.actor.state_dict(), 
-            "q1 state":self.q1.state_dict(),
-            "q1 target":self.q1_target.state_dict(),
-            "q2 state":self.q2.state_dict(),
-            "q2 target":self.q2_target.state_dict(),
-            
-            "actor optim state" : self.actor.optim.state_dict(),
-            "q1 optim state":self.q1_optim.state_dict(),
-            "q2 optim state":self.q2_optim.state_dict(),
-
-            "alpha optim state":self.alpha_optim.state_dict(),
-            "log_alpha":self.log_alpha,
-
-        }
+        check = {"actor state": self.actor.state_dict()}
         torch.save(check,f"{self.storage_path}{step}.pth")
 
-    
-    def load(self,model_path = None,strict=True):
-        if model_path is not None:
-            check = torch.load(model_path,weights_only=False,map_location=hypers.device)
-            self.actor.load_state_dict(check["actor state"],strict)
-            self.q1.load_state_dict(check["q1 state"],strict)
-            self.q1_target.load_state_dict(check["q1 target"],strict)
-            self.q2.load_state_dict(check["q2 state"],strict)
-            self.q2_target.load_state_dict(check["q2 target"],strict)
-            
-            self.actor.optim.load_state_dict(check["actor optim state"])
-            self.q1_optim.load_state_dict(check["q1 optim state"])
-            self.q2_optim.load_state_dict(check["q2 optim state"])
-
-            self.log_alpha.data.copy_(check["log_alpha"].data)
-            self.alpha_optim.load_state_dict(check["alpha optim state"])
-        
 
     def train(self,start=False):
         if start:
-
-            mlflow.set_experiment("sac-lift-robosuite")
+            mlflow.set_experiment("sac-lift-Robosuite")
             with mlflow.start_run() as run:
                 run_id = run.info.run_id
 
-                self.load(model_path=None)
                 actor_cpu = Actor()
                 actor_cpu.load_state_dict(self.actor.state_dict()) # importand when resuming with a pretrained model
                 actor_cpu.share_memory()
@@ -321,7 +318,7 @@ class main:
                 process__ = []
                 for n in range(5):
                     step_process = mp.Process(target=step,args=(ep_queue,actor_cpu,),daemon=True)
-                    process__.append(step_thread)
+                    process__.append(step_process)
                     step_process.start() 
 
                 print_queue_loading(ep_queue)
@@ -357,21 +354,15 @@ class main:
                         nx_actions,log_nx_actions,_ = self.actor(nx_states)
                         min_q_target = torch.min(self.q1_target(nx_states,nx_actions),self.q2_target(nx_states,nx_actions))
                         q_target = reward + hypers.gamma * (1-terminated) * (min_q_target - alpha.detach() * log_nx_actions)
-
-                    q1_pred = self.q1(states,actions) 
-                    q1_loss = F.smooth_l1_loss(q1_pred,q_target)
-                    self.q1_optim.zero_grad(set_to_none=True)
-                    q1_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.q1.parameters(),1.0)
-                    self.q1_optim.step() # critic 1 
-
-                    q2_pred = self.q2(states,actions) 
-                    q2_loss = F.smooth_l1_loss(q2_pred,q_target)
-                    self.q2_optim.zero_grad(set_to_none=True)
-                    q2_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.q2.parameters(),1.0)
-                    self.q2_optim.step() # critic 2 
                     
+                    q1_pred = self.q1(states,actions) 
+                    q2_pred = self.q2(states,actions) 
+                    q_loss = F.smooth_l1_loss(q1_pred,q_target) + F.smooth_l1_loss(q2_pred,q_target)
+                    self.q_optim.zero_grad(set_to_none=True)
+                    q_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(chain(self.q1.parameters(), self.q2.parameters()),1.0)
+                    self.q_optim.step()
+       
                     # polyak averaging
                     for q1_pars,q1_target_pars in zip(self.q1.parameters(),self.q1_target.parameters()):
                         q1_target_pars.data.mul_(1.0 - hypers.tau).add_(q1_pars.data,alpha=hypers.tau)
@@ -397,10 +388,6 @@ class main:
                     self.alpha_optim.step()
                     alpha = self.log_alpha.exp()
 
-                    if traj > 0 and traj % int(20e3) == 0 :
-                        self.n+=1
-                        self.save(self.n)
-
                     if traj > 0 and traj % int(1e3) == 0 :
                         mlflow.log_metrics(
                             {
@@ -415,12 +402,15 @@ class main:
 
                                 "critic/log action" : (alpha * log_nx_actions).mean().item(),
                                 "critic/pred min Q target" : min_q_target.mean().item(),
-                                "critic/critic 1 Loss" : q1_loss.item(),
-                                "critic/critic 2 Loss" : q2_loss.item()
+                                "critic/q loss": q_loss.item()
 
                             },
                             step = traj
                         )
+
+                        if traj > 0 and traj % int(20e4) == 0 :
+                            self.n+=1
+                            self.save(self.n)
                 
                 # killing processes and closing thread and queue
                 for p in process__:
@@ -442,6 +432,6 @@ class main:
                             
 
 if __name__ == "__main__": 
-    mp.set_start_method("spawn",force=True)
+    mp.set_start_method("spawn", force=True)
     mp.set_sharing_strategy("file_system")
     main(storage_path="./").train(True)
