@@ -70,7 +70,7 @@ class main:
 
     def get_critics_loss(self, q1_pred, q2_pred, q_target):    
         assert q1_pred.shape == q2_pred.shape == q_target.shape 
-        return F.smooth_l1_loss(q1_pred, q_target), F.smooth_l1_loss(q2_pred, q_target)
+        return F.smooth_l1_loss(q1_pred, q_target) +  F.smooth_l1_loss(q2_pred, q_target)
         
     def get_policy_loss(self, q1, q2, alpha, log_pi):
         assert q1.shape == q2.shape == log_pi.shape
@@ -119,11 +119,7 @@ class main:
                     nx_actions, log_nx_actions,_ = self.llp(_nx_states, _hl_goals)
                     q1 = q1_target_net(_nx_states, nx_actions, _hl_goals)
                     q2 = q2_target_net(_nx_states, nx_actions, _hl_goals)
-                    q_target = self.compute_q_target(q1, q2, log_nx_actions, _local_reward, _dones, ll_alpha)
-                                         
-                q1_pred = q1_net(_states, _actions, _hl_goals) 
-                q2_pred = q2_net(_states, _actions, _hl_goals)
-                q1_loss, q2_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
+                    q_target = self.compute_q_target(q1, q2, log_nx_actions, _local_reward, _dones, ll_alpha) 
                 
                 q1_pred = q1_net(_states, _actions, _hl_goals) 
                 q2_pred = q2_net(_states, _actions, _hl_goals)
@@ -185,11 +181,7 @@ class main:
                     q1 = q1_target_net(_nx_states, nx_actions)
                     q2 = q2_target_net(_nx_states, nx_actions)
                     q_target = self.compute_q_target(q1, q2, log_nx_actions, _reward, _dones, hl_alpha, exp=10)
-             
-                q1_pred = q1_net(_states, _hl_goals)
-                q2_pred = q2_net(_states, _hl_goals)
-                q1_loss, q2_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
-                
+
                 q1_pred = q1_net(_states, _hl_goals)
                 q2_pred = q2_net(_states, _hl_goals)
                 hl_q_loss = self.get_critics_loss(q1_pred, q2_pred, q_target) 
