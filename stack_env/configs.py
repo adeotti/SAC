@@ -10,7 +10,7 @@ class Hypers:
     device = torch.device("cuda:0")
     obs_dim = 81   
     ll_action_dim = 9  # low level action dim
-    hl_action_dim = 6  # high level action dim
+    hl_action_dim = 9  # high level action dim
     batch_size = 1024
     policy_lr = 1e-4 
     critic_lr = 1e-3
